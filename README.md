@@ -24,8 +24,8 @@ flowchart TD
     subgraph ClientLayer["Presentation & Interaction Layer (app.py)"]
         UI["Streamlit Interface<br/>Multi-Tab Session State"]
         Visuals["BI Analytics Engine<br/>Plotly Visualizations + CSV/XLSX Export"]
-        Uploader["Direct Streaming Uploader<br/>(Up to 4 TB • CSV, TSV, XLSX, XLS, PARQUET)"]
-        History["Browser-Style Chat History<br/>(Isolated Multi-Tab Navigation)"]
+        Uploader["Batch Streaming Ingestion Engine<br/>(10+ Files Simultaneous • Up to 4 TB per file)"]
+        History["Browser-Style Chat History<br/>(Isolated Multi-Tab Navigation via Query Params)"]
     end
 
     subgraph InfrastructureLayer["AWS ECS Runtime Environment"]
@@ -37,7 +37,8 @@ flowchart TD
     subgraph IntelligenceLayer["Agent & RAG Orchestration (agent.py)"]
         Agent["NLQueryAgent<br/>Converse API Orchestrator"]
         VectorStore["Dynamic Few-Shot Store<br/>(example_store.py)"]
-        SelfHealing["Self-Healing Reflection Loop<br/>(Exception Tracing & Syntax Repair)"]
+        JoinEngine["Cross-Table Join Engine<br/>(Dynamic Foreign Key Resolution)"]
+        SelfHealing["Self-Healing Reflection Loop<br/>(Diagnostic Tracing & Syntax Repair)"]
     end
 
     subgraph BedrockLayer["Amazon Bedrock Foundation Models"]
@@ -58,7 +59,7 @@ flowchart TD
     ECSTask --> UI
 
     %% Streaming Ingestion Flow
-    Uploader -->|"1. Multi-part Chunk Stream"| S3Data
+    Uploader -->|"1. Batch Multi-part Chunk Stream"| S3Data
     S3Data -->|"2. Schema Registration DDL"| Glue
     Glue -.->|"Register External Tables"| Athena
 
@@ -71,9 +72,10 @@ flowchart TD
     VectorStore -->|"5. Top-K Dialect SQL Templates"| Agent
 
     %% SQL Synthesis & Reflection
-    Agent -->|"6. Synthesize Trino SQL"| Nova
+    Agent -->|"6. Inspect Cross-Table Schemas"| JoinEngine
+    JoinEngine -->|"Synthesize Trino SQL + Explicit Joins"| Nova
     Nova -->|"7. Generated SQL Statement"| Agent
-    Agent -->|"8. Execute Query"| Athena
+    Agent -->|"8. Execute Query (DDL/DML Decoupled)"| Athena
 
     %% Athena Execution
     Athena -->|"Inspect Schema"| Glue
@@ -100,25 +102,32 @@ flowchart TD
 * Replaces container-bound databases with a scalable data lake (`s3://query-agent-lake-<account_id>/`).
 * Executes distributed SQL across tabular datasets using Amazon Athena's serverless Trino/Presto engine.
 * Removes container RAM and disk limits; stores query results directly in S3 result staging prefixes.
+* Handles DDL (`CREATE EXTERNAL TABLE`, `DROP TABLE`) and DML (`SELECT`) operations separately to prevent S3 staging collisions.
 
-### 2. High-Capacity Streaming Data Ingestion (Up to 4 TB)
+### 2. High-Capacity Batch Streaming Ingestion (10+ Mixed Datasets, Up to 4 TB)
 * Direct multi-part streaming ingestion via Boto3 to eliminate Out-Of-Memory (OOM) risks on small container runtimes.
-* Ingests **CSV**, **TSV**, **XLSX**, **XLS**, and columnar **PARQUET** datasets.
-* Automatically inspects schema dtypes and registers external tables directly into the **AWS Glue Data Catalog** (`query_agent_db`).
+* Ingests **CSV**, **TSV**, **XLSX**, **XLS**, and columnar **PARQUET** datasets concurrently with live progress tracking.
+* In-memory stream isolation prevents closed-file I/O exceptions while automatically mapping Pandas dtypes to Athena column definitions.
+* Drops and recreates table definitions dynamically in the **AWS Glue Data Catalog** (`query_agent_db`) without metadata collisions.
 
-### 3. Isolated Multi-Tab Chat History
+### 3. Cross-Table Relational Join Intelligence
+* Bedrock Nova Pro inspects all registered catalog schemas simultaneously to identify foreign key relationships.
+* Resolves columns residing across separate datasets (e.g., `city` in customer profiles joined with `order_value` in transaction logs) using explicit Presto/Trino SQL `JOIN` clauses.
+* Eliminates `COLUMN_NOT_FOUND` runtime exceptions through schema-aware reasoning and self-healing error traces.
+
+### 4. Isolated Multi-Tab Chat History
 * Browser-style conversation management powered by URL query parameters (`?session=<session_id>`) and a shared application resource cache.
 * Opening historical queries renders the selected conversation in a new, independent browser tab without resetting the active query workflow.
 
-### 4. Amazon Nova Pro Reasoning & Dynamic Few-Shot RAG
+### 5. Amazon Nova Pro Reasoning & Dynamic Few-Shot RAG
 * Generates Trino-compliant SQL using Amazon Bedrock's flagship `amazon.nova-pro-v1:0` model via the **Converse API**.
 * Employs **Amazon Titan Text Embeddings v2** (`amazon.titan-embed-text-v2:0`) to vector-search golden query patterns in-memory, mitigating token bloat while grounding syntax for complex joins and window functions.
 
-### 5. Autonomous Self-Healing Execution Loop
+### 6. Autonomous Self-Healing Execution Loop
 * Intercepts execution failures, schema mismatches, and syntax errors in real time.
 * Feeds raw database exceptions and execution traces back into Nova Pro for up to 3 automatic correction attempts before returning output.
 
-### 6. Interactive BI Dashboard & Secure Governance
+### 7. Interactive BI Dashboard & Secure Governance
 * Renders instant categorical/numerical breakdowns using dynamic **Plotly Express** charts.
 * Exports clean result sets directly to **CSV** and **Microsoft Excel (.xlsx)**.
 * Deployed with keyless IAM Task Role authorization; no long-lived AWS keys stored in code or containers.
@@ -132,13 +141,13 @@ query-agent/
 ├── .streamlit/
 │   ├── config.toml           # Streamlit server flags (4 TB maxUploadSize, CORS overrides)
 │   └── secrets.toml          # Local AWS credentials & region configuration (git-ignored)
-├── agent.py                  # Bedrock Converse orchestrator, RAG loader & self-healing loop
-├── app.py                    # Streamlit interface, multi-tab history, uploader & BI visuals
+├── agent.py                  # Bedrock Converse orchestrator, join engine & self-healing loop
+├── app.py                    # Streamlit interface, batch multi-file ingestion & BI visuals
 ├── athena_manager.py         # S3 streaming ingestion, Glue registration & Athena executor
 ├── database.py               # AST SQL sanitizer & planner cost validation utilities
 ├── example_store.py          # Dynamic few-shot vector store using Titan Embeddings v2
 ├── index_advisor.py          # Query pattern tracker & automated tuning advisor
-├── seed_athena.py            # Automated provisioner for S3 data lake & Glue tables
+├── seed_athena.py            # Automated provisioner for initial S3 data lake & Glue tables
 ├── Dockerfile                # Production multi-stage build (linux/amd64)
 ├── .dockerignore             # Excludes venvs, caches, and secrets from container images
 ├── requirements.txt          # Python production dependencies
@@ -148,10 +157,11 @@ query-agent/
 
 ---
 
-## Data Catalog Schema (`query_agent_db`)
+## Data Catalog & Dynamic Schema Engine (`query_agent_db`)
 
-The provisioned data lakehouse includes an enterprise e-commerce schema hosted in S3 and cataloged in AWS Glue:
+The platform supports both seeded baseline tables and on-the-fly multi-file catalog registrations:
 
+### Baseline Seeded E-Commerce Tables
 ```sql
 CREATE EXTERNAL TABLE query_agent_db.customers (
     customer_id INT,
@@ -193,6 +203,12 @@ CREATE EXTERNAL TABLE query_agent_db.order_items (
 STORED AS TEXTFILE
 LOCATION 's3://query-agent-lake-<account_id>/data/order_items/';
 ```
+
+### Dynamic Multi-Domain Ingestion
+Uploading custom datasets via the sidebar automatically builds Hive-compliant external tables. Supported domains include:
+* **Food Delivery & QSR (`zomato_customers`, `zomato_orders`)**: Customer demographic profiles, order statuses, coupons, ratings, and delivery times.
+* **Music Streaming (`spotify`)**: User engagement, genre analytics, device types, skip counts, and playback metrics.
+* **Marketplace Operations (`vendor`, `vendor_inventory`, `product`, `market_date_info`)**: Multi-table inventory volumes, product sizing, booth allocations, and weather correlation.
 
 ---
 
