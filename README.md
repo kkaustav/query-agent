@@ -263,6 +263,22 @@ aws ecs update-service --cluster default --service query-agent --force-new-deplo
 
 ---
 
+## On-Demand Service Control (Cost Optimization)
+
+To eliminate 24/7 AWS Fargate compute charges when not actively presenting demos or interviewing, scale the container task count to zero. All S3 data lake files, Glue table catalogs, and Docker container images remain intact.
+
+### Stop Service (Scale to 0 tasks — halts compute billing):
+```bash
+aws ecs update-service --cluster default --service query-agent --desired-count 0 --region us-east-1
+```
+
+### Start Service (Scale to 1 task — live and ready in ~45 seconds):
+```bash
+aws ecs update-service --cluster default --service query-agent --desired-count 1 --region us-east-1
+```
+
+---
+
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
