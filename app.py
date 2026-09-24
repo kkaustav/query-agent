@@ -1,13 +1,102 @@
-import streamlit as st
 import os
 import io
+import re
+import sqlite3
 import boto3
 import pandas as pd
 import plotly.express as px
+import streamlit as st
 from database import DatabaseManager
 from agent import NLQueryAgent
 
-st.set_page_config(page_title="NL Query Agent", page_icon="⚡", layout="wide")
+# ==============================================================================
+# 1. STREAMLIT PAGE CONFIGURATION
+# ==============================================================================
+st.set_page_config(
+    page_title="NL Query Agent",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ==============================================================================
+# 2. RESILIENT CREDENTIALS & AWS CONFIGURATION (HANDLED IN BACKGROUND)
+# ==============================================================================
+def get_secret(key: str, default=None):
+    """Safely retrieves keys without raising StreamlitSecretNotFoundError."""
+    try:
+        return st.secrets.get(key, os.getenv(key, default))
+    except Exception:
+        return os.getenv(key, default)
+
+aws_key = get_secret("AWS_ACCESS_KEY_ID")
+aws_secret = get_secret("AWS_SECRET_ACCESS_KEY")
+aws_region = get_secret("AWS_DEFAULT_REGION", "us-east-1")
+model_choice = "amazon.nova-pro-v1:0"
+connection_uri = "sqlite:///data/ecommerce.db"
+db_path = os.path.abspath("data/ecommerce.db")
+
+# Verify AWS identity (supports ECS Task Roles and local credentials silently)
+try:
+    session = boto3.Session(region_name=aws_region)
+    has_credentials = (session.get_credentials() is not None) or bool(aws_key and aws_secret)
+except Exception:
+    has_credentials = False
+
+# ==============================================================================
+# 3. DATA INGESTION ENGINE (CSV, Excel, Parquet, JSON, SQLite)
+# ==============================================================================
+def ingest_uploaded_file(uploaded_file, target_db_path: str) -> tuple[bool, str]:
+    """Parses multiple data formats directly into the active SQLite database."""
+    fname = uploaded_file.name
+    tbl_name = re.sub(r'[^a-zA-Z0-9_]', '_', fname.rsplit('.', 1)[0].lower())
+    os.makedirs(os.path.dirname(target_db_path), exist_ok=True)
+
+    try:
+        # 1. Direct SQLite database replacement
+        if fname.endswith(('.db', '.sqlite', '.sqlite3')):
+            with open(target_db_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            return True, f"Replaced active database with `{fname}`."
+
+        # 2. Delimited text files (CSV / TSV)
+        elif fname.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        elif fname.endswith('.tsv'):
+            df = pd.read_csv(uploaded_file, sep='\t')
+
+        # 3. Excel Spreadsheets (multi-sheet support)
+        elif fname.endswith(('.xlsx', '.xls')):
+            excel_file = pd.ExcelFile(uploaded_file)
+            with sqlite3.connect(target_db_path) as conn:
+                for sheet in excel_file.sheet_names:
+                    sheet_df = pd.read_excel(excel_file, sheet_name=sheet)
+                    s_tbl = f"{tbl_name}_{re.sub(r'[^a-zA-Z0-9_]', '_', sheet.lower())}" if len(excel_file.sheet_names) > 1 else tbl_name
+                    sheet_df.to_sql(s_tbl, conn, if_exists="replace", index=False)
+            return True, f"Ingested {len(excel_file.sheet_names)} sheet(s) into database from `{fname}`."
+
+        # 4. Parquet columnar
+        elif fname.endswith('.parquet'):
+            df = pd.read_parquet(uploaded_file)
+
+        # 5. JSON / JSON Lines
+        elif fname.endswith(('.json', '.jsonl')):
+            try:
+                df = pd.read_json(uploaded_file)
+            except ValueError:
+                uploaded_file.seek(0)
+                df = pd.read_json(uploaded_file, lines=True)
+        else:
+            return False, f"Unsupported file type: {fname}"
+
+        # Write DataFrame to SQLite
+        with sqlite3.connect(target_db_path) as conn:
+            df.to_sql(tbl_name, conn, if_exists="replace", index=False)
+
+        return True, f"Created table `{tbl_name}` ({len(df):,} rows, {len(df.columns)} columns)."
+
+    except Exception as err:
+        return False, f"Ingestion failed: {str(err)}"
 
 # In-memory export helpers
 @st.cache_data
@@ -21,75 +110,14 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, index=False, sheet_name="Query_Results")
     return output.getvalue()
 
-# Session State for conversation history
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# ==========================================
-# SIDEBAR: AWS BEDROCK & DATABASE SETTINGS
-# ==========================================
-st.sidebar.title("Agent Controls")
-
-# 1. Inspect Streamlit Secrets / Environment
-aws_key = st.secrets.get("AWS_ACCESS_KEY_ID", os.getenv("AWS_ACCESS_KEY_ID", None))
-aws_secret = st.secrets.get("AWS_SECRET_ACCESS_KEY", os.getenv("AWS_SECRET_ACCESS_KEY", None))
-aws_region = st.secrets.get("AWS_DEFAULT_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
-
-# 2. Check if local AWS CLI credentials or secrets exist
-try:
-    session = boto3.Session(region_name=aws_region)
-    has_credentials = (session.get_credentials() is not None) or bool(aws_key and aws_secret)
-except Exception:
-    has_credentials = False
-
-if has_credentials:
-    st.sidebar.success("⚡ AWS Bedrock: Authenticated")
-else:
-    st.sidebar.warning("No AWS credentials detected.")
-    aws_key = st.sidebar.text_input("AWS Access Key ID", type="password")
-    aws_secret = st.sidebar.text_input("AWS Secret Access Key", type="password")
-
-aws_region = st.sidebar.selectbox("AWS Region", ["us-east-1", "us-west-2", "ap-south-1"], index=0)
-
-model_choice = st.sidebar.text_input(
-    "Bedrock Model ID",
-    value="amazon.nova-pro-v1:0"
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Database Target")
-db_type = st.sidebar.selectbox("Engine Target", ["SQLite (Local Sandbox)", "PostgreSQL", "MySQL"])
-
-if db_type == "SQLite (Local Sandbox)":
-    connection_uri = "sqlite:///data/ecommerce.db"
-elif db_type == "PostgreSQL":
-    connection_uri = st.sidebar.text_input("PostgreSQL URI", placeholder="postgresql+psycopg2://user:pass@host:5432/dbname", type="password")
-elif db_type == "MySQL":
-    connection_uri = st.sidebar.text_input("MySQL URI", placeholder="mysql+pymysql://user:pass@host:3306/dbname", type="password")
-
-if not connection_uri:
-    st.info("Please enter a valid connection string.")
-    st.stop()
-
+# ==============================================================================
+# 4. RESOURCE CACHING
+# ==============================================================================
 @st.cache_resource(ttl=3600)
 def get_db_manager(uri: str):
     return DatabaseManager(connection_uri=uri)
 
-try:
-    db_manager = get_db_manager(connection_uri)
-    st.sidebar.success(f"Connected: `{db_manager.dialect.upper()}` Engine")
-except Exception as e:
-    st.sidebar.error(f"Connection Failed: {e}")
-    st.stop()
-
-if st.sidebar.button("🗑️ Reset Chat History", use_container_width=True):
-    st.session_state.messages = []
-    st.rerun()
-
-with st.sidebar.expander("Inspect Target Schema"):
-    st.code(db_manager.get_schema(), language="sql")
-
-@st.cache_resource(show_spinner="Connecting to Bedrock & Pre-Computing Embeddings...")
+@st.cache_resource(show_spinner="Initializing Bedrock Agent Pipeline...")
 def get_agent(key: str, secret: str, region: str, model: str, uri: str):
     return NLQueryAgent(
         aws_access_key=key if key else None,
@@ -99,13 +127,51 @@ def get_agent(key: str, secret: str, region: str, model: str, uri: str):
         db_manager=get_db_manager(uri)
     )
 
-# ==========================================
-# MAIN INTERFACE & CONVERSATION DISPLAY
-# ==========================================
+try:
+    db_manager = get_db_manager(connection_uri)
+except Exception as e:
+    st.error(f"Database Connection Failed: {e}")
+    st.stop()
+
+# ==============================================================================
+# 5. CLEAN SIDEBAR: INGESTION & CONTROLS ONLY
+# ==============================================================================
+with st.sidebar:
+    st.subheader("📂 Data Ingestion")
+    uploaded_file = st.file_uploader(
+        "Upload dataset",
+        type=["csv", "tsv", "xlsx", "xls", "parquet", "json", "jsonl", "db", "sqlite", "sqlite3"],
+        help="Upload tabular datasets or an existing SQLite database."
+    )
+    if uploaded_file is not None:
+        if st.button("Load Dataset", use_container_width=True):
+            with st.spinner("Processing and indexing data..."):
+                success, msg = ingest_uploaded_file(uploaded_file, db_path)
+                if success:
+                    st.success(msg)
+                    st.cache_resource.clear()
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.markdown("---")
+    with st.expander("Inspect Database Schema", expanded=False):
+        st.code(db_manager.get_schema(), language="sql")
+
+    if st.button("🗑️ Reset Chat History", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+# ==============================================================================
+# 6. MAIN CHAT INTERFACE
+# ==============================================================================
 st.title("Natural Language Database Query Agent")
 st.caption("Powered by Amazon Nova Pro & Bedrock • Autonomous Text-to-SQL Engine")
 
-# Replay previous chat turns
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Replay conversation history
 for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         if msg["role"] == "user":
@@ -141,14 +207,12 @@ for idx, msg in enumerate(st.session_state.messages):
                     st.markdown(f"**Reasoning:** {rec['reasoning']}")
                     st.code(rec["ddl"], language="sql")
 
-# ==========================================
-# USER INPUT & QUERY EXECUTION
-# ==========================================
-user_query = st.chat_input("Ask a question about sales, products, or customers...")
+# User Input & Execution Pipeline
+user_query = st.chat_input("Ask a question about your database...")
 
 if user_query:
-    if not has_credentials and (not aws_key or not aws_secret):
-        st.error("Please provide AWS Credentials in `.streamlit/secrets.toml` or the sidebar.")
+    if not has_credentials:
+        st.error("AWS Credentials not detected. Ensure the ECS task role or local environment is configured.")
         st.stop()
 
     agent = get_agent(aws_key, aws_secret, aws_region, model_choice, connection_uri)
