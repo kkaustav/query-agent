@@ -16,12 +16,13 @@ class AthenaManager:
         self.glue = boto3.client("glue", region_name=region)
         self.dialect = "athena"
 
-    def execute_query(self, sql: str) -> pd.DataFrame:
-        """Executes Trino/Presto SQL in Athena and returns a Pandas DataFrame."""
-        # Clean statement
+    def execute_query(self, sql: str, check_cost: bool = False, *args, **kwargs) -> tuple[pd.DataFrame, str]:
+        """
+        Executes Trino/Presto SQL in Athena. Returns (df, query_plan)
+        to match the interface expected by agent.py's self-healing loop.
+        """
         sql_clean = sql.strip().rstrip(";")
 
-        # Start execution
         response = self.athena.start_query_execution(
             QueryString=sql_clean,
             QueryExecutionContext={"Database": self.database},
@@ -29,12 +30,12 @@ class AthenaManager:
         )
         query_execution_id = response["QueryExecutionId"]
 
-        # Poll execution status
+        # Poll query execution status
         while True:
             status_resp = self.athena.get_query_execution(QueryExecutionId=query_execution_id)
             state = status_resp["QueryExecution"]["Status"]["State"]
 
-            if state in ["SUCCEEDED"]:
+            if state == "SUCCEEDED":
                 break
             elif state in ["FAILED", "CANCELLED"]:
                 reason = status_resp["QueryExecution"]["Status"].get("StateChangeReason", "Unknown error")
@@ -44,7 +45,13 @@ class AthenaManager:
         # Download result directly from Athena output S3 path
         result_key = f"athena-results/{query_execution_id}.csv"
         obj = self.s3.get_object(Bucket=self.bucket_name, Key=result_key)
-        return pd.read_csv(obj["Body"])
+        try:
+            df = pd.read_csv(obj["Body"])
+        except pd.errors.EmptyDataError:
+            df = pd.DataFrame()
+
+        plan_summary = f"Athena Execution ID: {query_execution_id}"
+        return df, plan_summary
 
     def get_schema(self) -> str:
         """Retrieves table and column metadata from the Glue Catalog for prompting."""
@@ -60,23 +67,19 @@ class AthenaManager:
 
     def stream_upload_and_create_table(self, uploaded_file) -> str:
         """
-        Streams uploaded file directly to S3 (no high RAM overhead)
-        and creates an external table in Athena.
+        Streams uploaded file directly to S3 and registers an external table in Athena.
         """
         fname = uploaded_file.name
         tbl_name = re.sub(r'[^a-zA-Z0-9_]', '_', fname.rsplit('.', 1)[0].lower())
         s3_prefix = f"data/{tbl_name}/"
         s3_key = f"{s3_prefix}{fname}"
 
-        # 1. Stream directly to S3 using multipart upload under the hood
         self.s3.upload_fileobj(uploaded_file, self.bucket_name, s3_key)
 
-        # 2. Inspect first few lines for CSV schema generation
         if fname.endswith(".csv"):
             uploaded_file.seek(0)
             sample_df = pd.read_csv(uploaded_file, nrows=100)
 
-            # Map Pandas dtypes to Athena/Hive types
             type_map = {
                 "int64": "BIGINT",
                 "float64": "DOUBLE",
@@ -102,7 +105,6 @@ class AthenaManager:
             TBLPROPERTIES ('skip.header.line.count'='1');
             """
 
-            # Execute DDL in Athena
             self.execute_query(create_sql)
             return f"Table `{tbl_name}` created and registered in Glue Catalog!"
 
