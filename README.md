@@ -288,6 +288,13 @@ To eliminate 24/7 AWS Fargate compute charges when not actively presenting demos
 aws ecs update-service --cluster default --service query-agent --desired-count 0 --region us-east-1
 ```
 
+### Check Service Status (Verify task counts without opening JSON pagers):
+```bash
+aws ecs describe-services --cluster default --services query-agent --query "services[0].[desiredCount,runningCount]" --output text --region us-east-1
+```
+* Returns `0   0` when fully stopped.
+* Returns `1   1` when fully running and ready.
+
 ### Start Service (Scale to 1 task — live and ready in ~45 seconds):
 ```bash
 aws ecs update-service --cluster default --service query-agent --desired-count 1 --region us-east-1
