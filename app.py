@@ -19,7 +19,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Hide Streamlit's default 200MB subtext, style dropzone, and style history links
 st.markdown(
     """
     <style>
@@ -29,7 +28,7 @@ st.markdown(
         display: none !important;
     }
 
-    /* Ensure the Upload / Browse button is visible and full-width */
+    /* Clean, full-width Upload / Browse button container */
     [data-testid="stFileUploaderDropzone"] {
         padding: 10px !important;
         min-height: unset !important;
@@ -133,7 +132,6 @@ def get_agent(key: str, secret: str, reg: str, model: str, _engine):
     )
 
 
-# Shared in-memory store so newly opened browser tabs can load archived chats
 @st.cache_resource
 def get_shared_sessions():
     return {}
@@ -178,8 +176,11 @@ elif requested_session_id and requested_session_id in shared_sessions and st.ses
     st.session_state.active_session_id = requested_session_id
     st.session_state.messages = list(shared_sessions[requested_session_id]["messages"])
 
+if "ingested_signatures" not in st.session_state:
+    st.session_state.ingested_signatures = set()
+
 # ==============================================================================
-# 5. SIDEBAR: DATA INGESTION, SCHEMA & NEW-TAB HISTORY LINKS
+# 5. SIDEBAR: BATCH MULTI-FILE INGESTION & BROWSER-STYLE CHAT HISTORY
 # ==============================================================================
 with st.sidebar:
     st.subheader("📂 S3 Data Lake Ingestion")
@@ -188,30 +189,62 @@ with st.sidebar:
         """
         <div class="badge-box">
             <b>Storage Limit:</b> Up to <b>4 TB</b> per dataset<br/>
-            <b>Allowed Formats:</b> CSV, TSV, XLSX, XLS, PARQUET
+            <b>Allowed Formats:</b> CSV, TSV, XLSX, XLS, PARQUET<br/>
+            <b>Batch Support:</b> Select 10+ files simultaneously
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    uploaded_file = st.file_uploader(
-        "Upload dataset directly to S3",
+    # Multi-file uploader accepting batch mixed file types
+    uploaded_files = st.file_uploader(
+        "Upload datasets directly to S3",
         type=["csv", "tsv", "xlsx", "xls", "parquet"],
+        accept_multiple_files=True,
         label_visibility="collapsed"
     )
 
-    if uploaded_file is not None:
-        file_signature = f"{uploaded_file.name}_{uploaded_file.size}"
-        if st.session_state.get("last_uploaded_file") != file_signature:
-            with st.spinner("Streaming file to S3 and registering schema in AWS Glue..."):
+    if uploaded_files:
+        current_signatures = {f"{f.name}_{f.size}" for f in uploaded_files}
+        st.session_state.ingested_signatures = st.session_state.ingested_signatures.intersection(current_signatures)
+
+        # Filter out files not yet streamed to S3
+        new_files = [f for f in uploaded_files if f"{f.name}_{f.size}" not in st.session_state.ingested_signatures]
+
+        if new_files:
+            success_count = 0
+            failed_uploads = []
+
+            progress_bar = st.progress(0, text="Initializing batch ingestion...")
+
+            for idx, file_obj in enumerate(new_files):
+                progress_percent = (idx + 1) / len(new_files)
+                progress_bar.progress(
+                    progress_percent,
+                    text=f"Streaming {file_obj.name} ({idx + 1}/{len(new_files)}) to S3 & Glue..."
+                )
                 try:
-                    msg = db_manager.stream_upload_and_create_table(uploaded_file)
-                    st.session_state["last_uploaded_file"] = file_signature
-                    st.success(msg)
-                    st.cache_resource.clear()
-                    st.rerun()
+                    db_manager.stream_upload_and_create_table(file_obj)
+                    st.session_state.ingested_signatures.add(f"{file_obj.name}_{file_obj.size}")
+                    success_count += 1
                 except Exception as err:
-                    st.error(f"Ingestion failed: {err}")
+                    failed_uploads.append(f"{file_obj.name}: {err}")
+
+            progress_bar.empty()
+
+            if success_count > 0:
+                st.session_state["upload_toast"] = "Data uploaded successfully"
+            if failed_uploads:
+                st.session_state["upload_error_banner"] = "Errors during batch ingestion:\n" + "\n".join(failed_uploads)
+
+            st.cache_resource.clear()
+            st.rerun()
+
+    # Clean Pop-up Toast Alert (no bulky green banner)
+    if "upload_toast" in st.session_state:
+        st.toast(st.session_state.pop("upload_toast"), icon="✅")
+    if "upload_error_banner" in st.session_state:
+        st.error(st.session_state.pop("upload_error_banner"))
 
     st.markdown("---")
     with st.expander("Inspect Athena / Glue Schema", expanded=False):
@@ -238,7 +271,6 @@ with st.sidebar:
             icon = "🟢 " if is_active else "💬 "
             display_title = f"{icon}{s_data['title']}"
 
-            # HTML Anchor with target="_blank" opens clean in a new tab
             st.markdown(
                 f"""
                 <a class="history-tab-link" href="/?session={s_id}" target="_blank" title="Open '{s_data['title']}' in new tab">
@@ -256,7 +288,6 @@ with st.sidebar:
 st.title("Natural Language Database Query Agent")
 st.caption("Powered by Amazon Nova Pro & Bedrock • Serverless S3 & Athena Analytics Engine")
 
-# If currently viewing an archived session from a query param, display an indicator
 if requested_session_id and requested_session_id in shared_sessions:
     st.info(f"Viewing archived conversation: **{shared_sessions[requested_session_id]['title']}**")
 
@@ -289,7 +320,7 @@ for idx, msg in enumerate(st.session_state.messages):
                         fig = px.bar(df, x=cat_cols[0], y=num_cols[0], title="Metric Breakdown")
                         st.plotly_chart(fig, use_container_width=True, key=f"chart_{idx}")
 
-            st.markdown(f"**Insight:** {msg['summary']}")
+            st.markdown(f"**Insight:** {msg.get('summary', '')}")
 
 # ==============================================================================
 # 7. USER INPUT & QUERY EXECUTION PIPELINE
@@ -363,7 +394,6 @@ if user_query:
             summary = agent.summarize_results(user_query, final_sql, df_preview)
             st.markdown(f"**Insight:** {summary}")
 
-    # Append to current session
     st.session_state.messages.append({"role": "user", "content": user_query})
     st.session_state.messages.append({
         "role": "assistant",
@@ -374,7 +404,6 @@ if user_query:
         "index_rec": index_rec
     })
 
-    # Save immediately into shared multi-tab storage
     curr_id = st.session_state.active_session_id
     active_first_msg = next(
         (m["content"] for m in st.session_state.messages if m.get("role") == "user"),
