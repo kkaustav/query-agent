@@ -1,29 +1,51 @@
 import os
 import io
 import re
-import sqlite3
 import boto3
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from database import DatabaseManager
+from athena_manager import AthenaManager
 from agent import NLQueryAgent
 
 # ==============================================================================
-# 1. STREAMLIT PAGE CONFIGURATION
+# 1. STREAMLIT PAGE CONFIGURATION & STYLING
 # ==============================================================================
 st.set_page_config(
-    page_title="NL Query Agent",
+    page_title="NL Query Agent (Athena Serverless Lake)",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# Text-wrapping overrides for file uploader and cached query history buttons
+st.markdown(
+    """
+    <style>
+    [data-testid="stFileUploader"] small, 
+    [data-testid="stFileUploaderDropzoneInstructions"] div {
+        white-space: normal !important;
+        word-break: break-word !important;
+        font-size: 0.75rem !important;
+        line-height: 1.3 !important;
+    }
+    button[key^="prev_req_"] {
+        text-align: left !important;
+        justify-content: flex-start !important;
+        border-radius: 6px !important;
+        font-size: 0.82rem !important;
+        padding: 4px 8px !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 # ==============================================================================
-# 2. RESILIENT CREDENTIALS & AWS CONFIGURATION (HANDLED IN BACKGROUND)
+# 2. CREDENTIALS & ATHENA DATA LAKE CONFIGURATION
 # ==============================================================================
 def get_secret(key: str, default=None):
-    """Safely retrieves keys without raising StreamlitSecretNotFoundError."""
+    """Safely retrieves secrets without raising StreamlitSecretNotFoundError."""
     try:
         return st.secrets.get(key, os.getenv(key, default))
     except Exception:
@@ -33,72 +55,45 @@ aws_key = get_secret("AWS_ACCESS_KEY_ID")
 aws_secret = get_secret("AWS_SECRET_ACCESS_KEY")
 aws_region = get_secret("AWS_DEFAULT_REGION", "us-east-1")
 model_choice = "amazon.nova-pro-v1:0"
-connection_uri = "sqlite:///data/ecommerce.db"
-db_path = os.path.abspath("data/ecommerce.db")
 
-# Verify AWS identity (supports ECS Task Roles and local credentials silently)
+# Auto-discover AWS Account ID for S3 lake bucket naming
 try:
-    session = boto3.Session(region_name=aws_region)
-    has_credentials = (session.get_credentials() is not None) or bool(aws_key and aws_secret)
+    session = boto3.Session(
+        aws_access_key_id=aws_key,
+        aws_secret_access_key=aws_secret,
+        region_name=aws_region
+    )
+    account_id = session.client("sts").get_caller_identity()["Account"]
+    has_credentials = True
 except Exception:
+    account_id = "default"
     has_credentials = False
 
+BUCKET_NAME = f"query-agent-lake-{account_id}"
+DATABASE_NAME = "query_agent_db"
+
 # ==============================================================================
-# 3. DATA INGESTION ENGINE (CSV, Excel, Parquet, JSON, SQLite)
+# 3. RESOURCE CACHING & ENGINE INITIALIZATION
 # ==============================================================================
-def ingest_uploaded_file(uploaded_file, target_db_path: str) -> tuple[bool, str]:
-    """Parses multiple data formats directly into the active SQLite database."""
-    fname = uploaded_file.name
-    tbl_name = re.sub(r'[^a-zA-Z0-9_]', '_', fname.rsplit('.', 1)[0].lower())
-    os.makedirs(os.path.dirname(target_db_path), exist_ok=True)
+@st.cache_resource(ttl=3600)
+def get_athena_engine(db_name: str, b_name: str, reg: str):
+    return AthenaManager(
+        database=db_name,
+        bucket_name=b_name,
+        region=reg
+    )
 
-    try:
-        # 1. Direct SQLite database replacement
-        if fname.endswith(('.db', '.sqlite', '.sqlite3')):
-            with open(target_db_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            return True, f"Replaced active database with `{fname}`."
+@st.cache_resource(show_spinner="Initializing Bedrock Nova Pro Agent Pipeline...")
+def get_agent(key: str, secret: str, reg: str, model: str, engine):
+    return NLQueryAgent(
+        aws_access_key=key if key else None,
+        aws_secret_key=secret if secret else None,
+        aws_region=reg,
+        model=model,
+        db_manager=engine
+    )
 
-        # 2. Delimited text files (CSV / TSV)
-        elif fname.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        elif fname.endswith('.tsv'):
-            df = pd.read_csv(uploaded_file, sep='\t')
-
-        # 3. Excel Spreadsheets (multi-sheet support)
-        elif fname.endswith(('.xlsx', '.xls')):
-            excel_file = pd.ExcelFile(uploaded_file)
-            with sqlite3.connect(target_db_path) as conn:
-                for sheet in excel_file.sheet_names:
-                    sheet_df = pd.read_excel(excel_file, sheet_name=sheet)
-                    s_tbl = f"{tbl_name}_{re.sub(r'[^a-zA-Z0-9_]', '_', sheet.lower())}" if len(excel_file.sheet_names) > 1 else tbl_name
-                    sheet_df.to_sql(s_tbl, conn, if_exists="replace", index=False)
-            return True, f"Ingested {len(excel_file.sheet_names)} sheet(s) into database from `{fname}`."
-
-        # 4. Parquet columnar
-        elif fname.endswith('.parquet'):
-            df = pd.read_parquet(uploaded_file)
-
-        # 5. JSON / JSON Lines
-        elif fname.endswith(('.json', '.jsonl')):
-            try:
-                df = pd.read_json(uploaded_file)
-            except ValueError:
-                uploaded_file.seek(0)
-                df = pd.read_json(uploaded_file, lines=True)
-        else:
-            return False, f"Unsupported file type: {fname}"
-
-        # Write DataFrame to SQLite
-        with sqlite3.connect(target_db_path) as conn:
-            df.to_sql(tbl_name, conn, if_exists="replace", index=False)
-
-        return True, f"Created table `{tbl_name}` ({len(df):,} rows, {len(df.columns)} columns)."
-
-    except Exception as err:
-        return False, f"Ingestion failed: {str(err)}"
-
-# In-memory export helpers
+# Export Helpers
 @st.cache_data
 def convert_df_to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -110,74 +105,76 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, index=False, sheet_name="Query_Results")
     return output.getvalue()
 
-# ==============================================================================
-# 4. RESOURCE CACHING
-# ==============================================================================
-@st.cache_resource(ttl=3600)
-def get_db_manager(uri: str):
-    return DatabaseManager(connection_uri=uri)
-
-@st.cache_resource(show_spinner="Initializing Bedrock Agent Pipeline...")
-def get_agent(key: str, secret: str, region: str, model: str, uri: str):
-    return NLQueryAgent(
-        aws_access_key=key if key else None,
-        aws_secret_key=secret if secret else None,
-        aws_region=region,
-        model=model,
-        db_manager=get_db_manager(uri)
-    )
-
 try:
-    db_manager = get_db_manager(connection_uri)
+    db_manager = get_athena_engine(DATABASE_NAME, BUCKET_NAME, aws_region)
 except Exception as e:
-    st.error(f"Database Connection Failed: {e}")
+    st.error(f"Athena Connection Initialization Failed: {e}")
     st.stop()
 
 # ==============================================================================
-# 5. CLEAN SIDEBAR: INGESTION & CONTROLS ONLY
+# 4. SIDEBAR: DATA INGESTION, SCHEMA & 1-CLICK QUERY CACHE
 # ==============================================================================
-with st.sidebar:
-    st.subheader("📂 Data Ingestion")
-    uploaded_file = st.file_uploader(
-        "Upload dataset",
-        type=["csv", "tsv", "xlsx", "xls", "parquet", "json", "jsonl", "db", "sqlite", "sqlite3"],
-        help="Upload tabular datasets or an existing SQLite database."
-    )
-    if uploaded_file is not None:
-        if st.button("Load Dataset", use_container_width=True):
-            with st.spinner("Processing and indexing data..."):
-                success, msg = ingest_uploaded_file(uploaded_file, db_path)
-                if success:
-                    st.success(msg)
-                    st.cache_resource.clear()
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-    st.markdown("---")
-    with st.expander("Inspect Database Schema", expanded=False):
-        st.code(db_manager.get_schema(), language="sql")
-
-    if st.button("🗑️ Reset Chat History", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
-
-# ==============================================================================
-# 6. MAIN CHAT INTERFACE
-# ==============================================================================
-st.title("Natural Language Database Query Agent")
-st.caption("Powered by Amazon Nova Pro & Bedrock • Autonomous Text-to-SQL Engine")
-
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Replay conversation history
+with st.sidebar:
+    st.subheader("📂 S3 Data Lake Ingestion")
+    uploaded_file = st.file_uploader(
+        "Upload dataset directly to S3",
+        type=["csv", "tsv", "xlsx", "xls", "parquet"],
+        help="Streams file into your S3 Data Lake and registers it as an Athena external table."
+    )
+    if uploaded_file is not None:
+        if st.button("Load Dataset into Lake", use_container_width=True):
+            with st.spinner("Streaming file to S3 and registering schema in AWS Glue..."):
+                try:
+                    msg = db_manager.stream_upload_and_create_table(uploaded_file)
+                    st.success(msg)
+                    st.cache_resource.clear()
+                    st.rerun()
+                except Exception as err:
+                    st.error(f"Ingestion failed: {err}")
+
+    st.markdown("---")
+    with st.expander("Inspect Athena / Glue Schema", expanded=False):
+        try:
+            st.code(db_manager.get_schema(), language="sql")
+        except Exception:
+            st.caption("No tables registered in catalog yet.")
+
+    if st.button("🗑️ Reset Chat History", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.pop("queued_prompt", None)
+        st.rerun()
+
+    # 1-Click Cached Requests List
+    st.markdown("---")
+    st.subheader("🕒 Previous Requests")
+    historical_queries = [
+        msg["content"] for msg in st.session_state.messages
+        if msg.get("role") == "user"
+    ]
+    if historical_queries:
+        for idx, q_text in enumerate(reversed(historical_queries)):
+            display_label = (q_text[:32] + "...") if len(q_text) > 32 else q_text
+            if st.button(f"💬 {display_label}", key=f"prev_req_{idx}", use_container_width=True, help=f"Click to run: {q_text}"):
+                st.session_state["queued_prompt"] = q_text
+                st.rerun()
+    else:
+        st.caption("No previous requests yet. Queries you submit will appear here.")
+
+# ==============================================================================
+# 5. MAIN CHAT INTERFACE & CONVERSATION DISPLAY
+# ==============================================================================
+st.title("Natural Language Database Query Agent")
+st.caption("Powered by Amazon Nova Pro & Bedrock • Serverless S3 & Athena Analytics Engine")
+
 for idx, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         if msg["role"] == "user":
             st.write(msg["content"])
         elif msg["role"] == "assistant":
-            st.markdown("**Generated SQL:**")
+            st.markdown("**Generated Athena SQL:**")
             st.code(msg["sql"], language="sql")
 
             df = msg["df"]
@@ -200,31 +197,27 @@ for idx, msg in enumerate(st.session_state.messages):
 
             st.markdown(f"**Insight:** {msg['summary']}")
 
-            if msg.get("index_rec"):
-                rec = msg["index_rec"]
-                st.info(f"💡 **Database Tuning Alert: Unindexed Scans on `{rec['table']}`**")
-                with st.expander(f"View Recommended DDL for `{rec['table']}`"):
-                    st.markdown(f"**Reasoning:** {rec['reasoning']}")
-                    st.code(rec["ddl"], language="sql")
-
-# User Input & Execution Pipeline
-user_query = st.chat_input("Ask a question about your database...")
+# ==============================================================================
+# 6. USER INPUT & QUERY EXECUTION PIPELINE
+# ==============================================================================
+queued_prompt = st.session_state.pop("queued_prompt", None)
+user_query = st.chat_input("Ask a question about your S3 data lake...") or queued_prompt
 
 if user_query:
     if not has_credentials:
-        st.error("AWS Credentials not detected. Ensure the ECS task role or local environment is configured.")
+        st.error("AWS Credentials not detected. Ensure the ECS task role or AWS environment is configured.")
         st.stop()
 
-    agent = get_agent(aws_key, aws_secret, aws_region, model_choice, connection_uri)
+    agent = get_agent(aws_key, aws_secret, aws_region, model_choice, db_manager)
     st.chat_message("user").write(user_query)
 
     history_turns = [
         {"question": m["prompt_ref"], "sql": m["sql"]}
-        for m in st.session_state.messages if m["role"] == "assistant" and "sql" in m
+        for m in st.session_state.messages if m.get("role") == "assistant" and "sql" in m
     ]
 
     with st.chat_message("assistant"):
-        with st.status("Agent reasoning & Bedrock execution pipeline...", expanded=True) as status_box:
+        with st.status("Agent reasoning & Athena execution pipeline...", expanded=True) as status_box:
             try:
                 df, final_sql, trace, examples, index_rec = agent.run_query_with_self_healing(
                     natural_query=user_query,
@@ -244,11 +237,11 @@ if user_query:
                 status_box.update(label="Query executed successfully!", state="complete", expanded=False)
 
             except Exception as e:
-                status_box.update(label="Execution loop failed", state="error", expanded=True)
+                status_box.update(label="Athena execution failed", state="error", expanded=True)
                 st.error(f"Error: {e}")
                 st.stop()
 
-        st.markdown("**Generated SQL:**")
+        st.markdown("**Generated Athena SQL:**")
         st.code(final_sql, language="sql")
 
         curr_idx = len(st.session_state.messages)
@@ -272,12 +265,6 @@ if user_query:
         with st.spinner("Synthesizing answer..."):
             summary = agent.summarize_results(user_query, final_sql, df.head(10).to_string())
             st.markdown(f"**Insight:** {summary}")
-
-        if index_rec:
-            st.info(f"💡 **Database Tuning Alert: Unindexed Scans on `{index_rec['table']}`**")
-            with st.expander(f"View Recommended DDL for `{index_rec['table']}`"):
-                st.markdown(f"**Reasoning:** {index_rec['reasoning']}")
-                st.code(index_rec["ddl"], language="sql")
 
     # Persist the full turn in state
     st.session_state.messages.append({"role": "user", "content": user_query})
