@@ -1,13 +1,19 @@
 # Autonomous Natural Language Database Query Agent (Serverless Data Lakehouse)
 
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://query-agent.streamlit.app/)
+[![AWS ECS Live](https://img.shields.io/badge/AWS%20ECS-Production%20Deployment-232F3E.svg?logo=amazon-ecs&logoColor=white)](https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/)
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Amazon Bedrock](https://img.shields.io/badge/AWS-Bedrock%20Nova%20Pro-FF9900.svg?logo=amazon-aws&logoColor=white)](https://aws.amazon.com/bedrock/)
 [![Amazon Athena](https://img.shields.io/badge/AWS-Amazon%20Athena-232F3E.svg?logo=amazon-aws&logoColor=white)](https://aws.amazon.com/athena/)
 [![Amazon S3](https://img.shields.io/badge/AWS-Amazon%20S3%20Lake-569A31.svg?logo=amazon-s3&logoColor=white)](https://aws.amazon.com/s3/)
 [![AWS Glue](https://img.shields.io/badge/AWS-Glue%20Catalog-8C4FFF.svg?logo=amazon-aws&logoColor=white)](https://aws.amazon.com/glue/)
-[![Amazon ECS](https://img.shields.io/badge/AWS-ECS%20Express%20Mode-FF9900.svg?logo=amazon-aws&logoColor=white)](https://aws.amazon.com/ecs/)
 [![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED.svg?logo=docker&logoColor=white)](https://www.docker.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+> **Live Deployments:**
+> * **Primary (Always Online):** [https://query-agent.streamlit.app/](https://query-agent.streamlit.app/)
+> * **Enterprise AWS Production (ECS Fargate + ALB):** [https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/](https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/)  
+> *(Note: The AWS ECS Fargate task is scaled to 0 tasks when idle to optimize cloud costs; can be scaled to 1 on-demand via AWS CLI).*
 
 An enterprise-grade, serverless Text-to-SQL conversational analytics platform. Translates natural language inquiries into Trino/Presto SQL, executes queries against an Amazon S3 data lake using Amazon Athena, dynamically registers schemas via AWS Glue Data Catalog, and provisions interactive Plotly visualizations with executive business insights.
 
