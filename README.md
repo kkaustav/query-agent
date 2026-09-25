@@ -17,7 +17,7 @@
 
 An enterprise-grade, serverless Text-to-SQL conversational analytics platform. Translates natural language inquiries into Trino/Presto SQL, validates query safety via Abstract Syntax Tree (AST) parsing, executes distributed queries over an Amazon S3 data lake using Amazon Athena, dynamically catalogs schemas via the AWS Glue Data Catalog, and provisions interactive Plotly visualizations paired with executive insights.
 
-Containerized with Docker, published to **Amazon ECR**, and hosted on **Amazon ECS Express Mode** backed by AWS Fargate with managed ALB routing and keyless IAM Task Role authentication for **Amazon Bedrock**.
+Containerized with Docker, published to **Amazon ECR**, and hosted on **Amazon ECS on AWS Fargate** with managed ALB routing and keyless IAM Task Role authentication for **Amazon Bedrock**.
 
 ---
 
@@ -386,7 +386,7 @@ Access the application locally at `http://localhost:8501`.
 
 ---
 
-## Production Deployment: AWS ECS Express Mode
+## Production Deployment: Amazon ECS on AWS Fargate
 
 ### Build and Deploy Container
 ```bash
