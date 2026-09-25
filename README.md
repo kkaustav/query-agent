@@ -15,7 +15,7 @@
 > * **Enterprise AWS Production (ECS Fargate + ALB):** [https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/](https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/)  
 > *(Note: The AWS ECS Fargate task is scaled to 0 tasks when idle to optimize cloud costs; spin up to 1 task on-demand via the AWS CLI).*
 
-An enterprise-grade, serverless Text-to-SQL conversational analytics platform. Translates natural language inquiries into Trino/Presto SQL, validates query safety via Abstract Syntax Tree (AST) parsing, executes distributed queries over an Amazon S3 data lake using Amazon Athena, dynamically catalogs schemas via the AWS Glue Data Catalog, and provisions interactive Plotly visualizations paired with executive insights.
+An enterprise-grade, serverless Text-to-SQL conversational analytics platform. Translates natural language inquiries into Trino/Presto SQL, enforces a declarative business semantic metric layer, validates query safety via Abstract Syntax Tree (AST) parsing, executes distributed queries over an Amazon S3 data lake using Amazon Athena, dynamically catalogs schemas via the AWS Glue Data Catalog, and provisions interactive Plotly visualizations paired with executive insights.
 
 Containerized with Docker, published to **Amazon ECR**, and hosted on **Amazon ECS on AWS Fargate** with managed ALB routing and keyless IAM Task Role authentication for **Amazon Bedrock**.
 
@@ -43,6 +43,7 @@ flowchart TD
     subgraph IntelligenceLayer["Agent Orchestration (agent.py)"]
         Agent["NLQueryAgent<br/>Converse API Orchestrator"]
         VectorStore["Dynamic Few-Shot Store<br/>(example_store.py)"]
+        SemanticLayer["Business Semantic Metric Store<br/>(metrics.yaml)"]
         JoinEngine["Cross-Table Join Engine<br/>(Dynamic Foreign Key Resolution)"]
         SelfHealing["Self-Healing Reflection Loop<br/>(Diagnostic Tracing & Syntax Repair)"]
     end
@@ -77,23 +78,24 @@ flowchart TD
     %% User Query Flow
     UI -->|"3. Natural Language Question"| Agent
 
-    %% Vector RAG
+    %% Vector RAG & Semantic Grounding
     Agent -->|"4. Embedding Query"| Titan
     Titan -->|"Cosine Similarity Match"| VectorStore
     VectorStore -->|"5. Top-K Dialect SQL Templates"| Agent
+    SemanticLayer -->|"6. Metric Formulas & Default Filters"| Agent
 
     %% SQL Synthesis & AST Validation
-    Agent -->|"6. Inspect Cross-Table Schemas"| JoinEngine
+    Agent -->|"7. Inspect Schemas & Metric Specs"| JoinEngine
     JoinEngine -->|"Synthesize Trino SQL"| Nova
-    Nova -->|"7. Raw SQL Output"| Agent
-    Agent -->|"8. AST Parse & Mutation Check"| ASTSanitizer
-    ASTSanitizer -->|"9. Approved Read-Only AST"| Athena
+    Nova -->|"8. Raw SQL Output"| Agent
+    Agent -->|"9. AST Parse & Mutation Check"| ASTSanitizer
+    ASTSanitizer -->|"10. Approved Read-Only AST"| Athena
 
     %% Athena Execution
     Athena -->|"Inspect Schema"| Glue
     Athena -->|"Scan Partitions"| S3Data
     Athena -->|"Stage CSV Results"| S3Results
-    S3Results -->|"10. Load DataFrames"| Agent
+    S3Results -->|"11. Load DataFrames"| Agent
 
     %% Feedback & Storage Optimization
     Athena -.->|"Runtime Error Diagnostic"| SelfHealing
@@ -101,8 +103,8 @@ flowchart TD
     Athena -.->|"Execution Metrics"| StorageAdvisor
 
     %% Output & History
-    Agent -->|"11. Data & Visuals"| UI
-    Agent -->|"12. Generate Executive Summary"| Nova
+    Agent -->|"12. Data & Visuals"| UI
+    Agent -->|"13. Generate Executive Summary"| Nova
     Nova -->|"Executive Insight"| Visuals
     UI --> History
 ```
@@ -111,38 +113,42 @@ flowchart TD
 
 ## Key System Features
 
-### 1. Serverless Lakehouse Architecture (Amazon S3 + Amazon Athena)
+### 1. Business Semantic Metric Layer (`metrics.yaml`)
+* Eliminates the primary failure mode of enterprise Text-to-SQL: business definition ambiguity.
+* Declaratively maps business formulas (e.g., `net_revenue = SUM(order_value - discount_amount)`), entity synonyms (e.g., `"Prime members" -> is_prime = true`), and default filter predicates (e.g., `order_status = 'delivered'`).
+* Injects ground truth formulas directly into Bedrock Nova Pro reasoning prompt, eliminating ad-hoc metric hallucinations.
+
+### 2. Serverless Lakehouse Architecture (Amazon S3 + Amazon Athena)
 * Replaces container-bound transactional databases with an analytical data lake (`s3://query-agent-lake-<account_id>/`).
 * Executes distributed SQL across tabular datasets using Amazon Athena's serverless Trino/Presto engine.
 * Supports both delimited text files (`CSV`, `TSV`) and columnar storage (`Apache Parquet` with Snappy compression).
 * Decouples DDL (`CREATE EXTERNAL TABLE`, `DROP TABLE`) and DML (`SELECT`) workflows to prevent S3 query staging collisions.
 
-### 2. Dual-Track Data Ingestion Strategy
+### 3. Dual-Track Data Ingestion Strategy
 * **Ad-Hoc UI Streaming (In-Band):** Streamlit file uploader supports batch uploading up to 10+ heterogeneous datasets (CSV, TSV, XLSX, XLS, PARQUET up to 1 GB per file) utilizing memory-buffered streaming to prevent container Out-Of-Memory (OOM) crashes on 2 GB Fargate tasks.
 * **Lakehouse Scale Ingestion (Out-Of-Band):** For multi-gigabyte or terabyte workloads exceeding container ephemeral storage (default 20 GB), files bypass the web server via S3 Multipart Uploads or AWS CLI direct-to-S3 ingestion, followed by immediate AWS Glue Catalog schema synchronization.
 
-### 3. AST Query Sanitization & Zero-Trust Safety (`database.py`)
+### 4. AST Query Sanitization & Zero-Trust Safety (`database.py`)
 * Employs Abstract Syntax Tree (AST) analysis via `sqlglot` to parse generated SQL before transmission to Athena.
 * **Strict Read-Only Enforcement:** Traverses the expression tree to verify root nodes are `Select` statements. Rejects destructive operations (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `TRUNCATE`, `GRANT`).
 * Neutralizes SQL injection and model hallucination vectors by blocking multi-statement execution and comments that bypass parser validation.
 
-### 4. Cross-Table Relational Join Intelligence
+### 5. Cross-Table Relational Join Intelligence
 * Bedrock Nova Pro inspects all active tables in the AWS Glue Data Catalog (`query_agent_db`) simultaneously.
 * Infers implicit foreign-key relationships across disparate operational domains (e.g., joining customer demographic attributes from `zomato_customers` with transaction volume in `zomato_orders`).
 * Employs explicit Presto/Trino SQL join semantics (`LEFT JOIN`, `INNER JOIN`) to eliminate `COLUMN_NOT_FOUND` runtime exceptions.
 
-### 5. Autonomous Self-Healing Execution Loop
+### 6. Autonomous Self-Healing Execution Loop
 * Intercepts execution failures, schema mismatches, and Trino dialect errors in real time.
 * Feeds raw database exceptions and execution traces back into Nova Pro for up to 3 automated correction iterations before returning output.
 
-### 6. Partition & Storage Layout Advisor (`index_advisor.py`)
-* Because Amazon Athena operates on serverless Trino over S3 without traditional B-tree indexes, performance and cost depend entirely on storage layout.
+### 7. Partition & Storage Layout Advisor (`index_advisor.py`)
 * Analyzes recurring query `WHERE` filters, `JOIN` predicates, and aggregations to output recommendations for:
   * **Partition Keys:** Identifying high-cardinality pruning candidates (e.g., `order_date`, `city`, `season`).
   * **Columnar Formats:** Advising conversion from raw CSV/JSON to Apache Parquet with Snappy compression to reduce scanned byte volume by 80–90%.
   * **Bucketing Strategies:** Recommending hash-bucketing keys for frequently joined foreign keys.
 
-### 7. Isolated Multi-Tab Chat History
+### 8. Isolated Multi-Tab Chat History
 * Session management powered by URL query parameters (`?session=<session_id>`) and a shared application resource cache.
 * Opening historical queries renders selected conversations in a new, independent browser tab without disrupting the active query session.
 
@@ -241,6 +247,7 @@ The agent was evaluated across 50 production test prompts spanning retail, music
 SELECT c.city, ROUND(SUM(o.order_value), 2) AS total_order_value
 FROM zomato_orders o
 JOIN zomato_customers c ON o.customer_id = c.customer_id
+WHERE LOWER(o.order_status) = 'delivered'
 GROUP BY c.city
 ORDER BY total_order_value DESC;
 ```
@@ -251,7 +258,7 @@ ORDER BY total_order_value DESC;
 SELECT c.customer_id, c.first_name, c.last_name, c.city, ROUND(SUM(o.order_value), 2) AS total_spend
 FROM zomato_customers c
 JOIN zomato_orders o ON c.customer_id = o.customer_id
-WHERE c.is_prime = true AND o.order_status = 'delivered'
+WHERE c.is_prime = true AND LOWER(o.order_status) = 'delivered'
 GROUP BY c.customer_id, c.first_name, c.last_name, c.city
 ORDER BY total_spend DESC
 LIMIT 5;
@@ -275,53 +282,29 @@ WHERE rank_num = 1;
 
 ---
 
-## Data Catalog & Dynamic Schema Engine (`query_agent_db`)
+## Enterprise Production Roadmap
 
-The platform supports both delimited text files and columnar Parquet tables:
+The following architectural components represent the planned progression from a single-tenant analytics agent to a high-scale enterprise platform:
 
-### Baseline Delimited E-Commerce Tables (Textfile)
-```sql
-CREATE EXTERNAL TABLE query_agent_db.customers (
-    customer_id INT,
-    name STRING,
-    email STRING,
-    country STRING,
-    created_at STRING
-)
-ROW FORMAT DELIMITED
-FIELDS TERMINATED BY ','
-STORED AS TEXTFILE
-LOCATION 's3://query-agent-lake-<account_id>/data/customers/'
-TBLPROPERTIES ('skip.header.line.count'='1');
+### 1. Two-Stage Semantic Schema Pruning (100+ Table Scale)
+* **Problem:** Feeding exhaustive Glue catalog DDLs for hundreds of tables creates context bloat, increases Bedrock latency, and degrades SQL generation accuracy.
+* **Solution:** Vectorize table and column metadata using Amazon Titan Text Embeddings v2. Query arrival triggers semantic retrieval of only the top 3–5 candidate tables, passing a pruned sub-schema into Nova Pro.
 
-CREATE EXTERNAL TABLE query_agent_db.orders (
-    order_id INT,
-    customer_id INT,
-    order_date STRING,
-    status STRING,
-    total_amount DOUBLE
-)
-ROW FORMAT DELIMITED
-FIELDS TERMINATED BY ','
-STORED AS TEXTFILE
-LOCATION 's3://query-agent-lake-<account_id>/data/orders/'
-TBLPROPERTIES ('skip.header.line.count'='1');
-```
+### 2. Semantic Query Caching (Sub-100ms / $0.00 Scans)
+* **Problem:** Analysts frequently submit identical inquiries with slight phrasing variations.
+* **Solution:** In-memory vector cache storing query embeddings and S3 result metadata. Queries matching existing embeddings at cosine similarity $> 0.96$ return staged Athena result sets immediately, cutting Bedrock token charges and Athena S3 scans to $0.00.
 
-### Columnar High-Performance Format (Apache Parquet)
-```sql
-CREATE EXTERNAL TABLE query_agent_db.spotify (
-    track_id BIGINT,
-    track_name STRING,
-    artist STRING,
-    genre STRING,
-    user_rating DOUBLE,
-    play_duration_seconds INT
-)
-STORED AS PARQUET
-LOCATION 's3://query-agent-lake-<account_id>/data/spotify/'
-TBLPROPERTIES ('parquet.compression'='SNAPPY');
-```
+### 3. Pre-Flight Cost & Scan Estimation (EXPLAIN Gating)
+* **Problem:** Runaway queries omitting partition filters on multi-terabyte unpartitioned tables risk substantial scan charges ($5/TB).
+* **Solution:** Pre-execution dry-run inspecting `EXPLAIN (TYPE DISTRIBUTED)` output and AST partition clauses. Automatically halts execution or injects bounded partition predicates if full-table scans exceed safety thresholds.
+
+### 4. Automated CI/CD Regression Benchmark Pipeline
+* **Problem:** Model prompt tweaks can introduce silent SQL dialect regressions.
+* **Solution:** A GitHub Actions test suite running 50 golden queries against an ephemeral Athena workgroup on pull requests, scoring syntax execution rates, semantic DataFrame validity, and token cost regressions.
+
+### 5. Identity Propagation & Row-Level Governance (AWS Lake Formation)
+* **Problem:** Monolithic IAM Task Role access provides identical data visibility to all users.
+* **Solution:** Integrate AWS Lake Formation with session-based identity pass-through. Restricts PII columns (customer emails, phone numbers) for marketing roles while maintaining visibility for authorized analytical roles.
 
 ---
 
@@ -330,7 +313,7 @@ TBLPROPERTIES ('parquet.compression'='SNAPPY');
 ```text
 query-agent/
 ├── .streamlit/
-│   ├── config.toml           # Streamlit server flags (CORS, memory buffers)
+│   ├── config.toml           # Streamlit server flags (1 GB maxUploadSize, CORS overrides)
 │   └── secrets.toml          # Local AWS credentials & region configuration (git-ignored)
 ├── agent.py                  # Bedrock Converse orchestrator, join engine & self-healing loop
 ├── app.py                    # Streamlit interface, batch streaming ingestion & BI visuals
@@ -338,6 +321,7 @@ query-agent/
 ├── database.py               # AST SQL sanitizer (sqlglot) & read-only enforcement
 ├── example_store.py          # Dynamic few-shot vector store using Titan Embeddings v2
 ├── index_advisor.py          # Partition & Storage Layout Advisor for S3 scan optimization
+├── metrics.yaml              # Declarative business metric store & semantic definitions
 ├── seed_athena.py            # Automated provisioner for initial S3 data lake & Glue tables
 ├── Dockerfile                # Production multi-stage build (linux/amd64)
 ├── .dockerignore             # Excludes venvs, caches, and secrets from container images

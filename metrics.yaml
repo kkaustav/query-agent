@@ -1,0 +1,30 @@
+version: 1
+semantic_layer:
+  metrics:
+    - name: net_revenue
+      description: "Total net monetary value from completed transactions after deducting discounts."
+      sql_expression: "ROUND(SUM(COALESCE(o.order_value, o.total_amount, 0) - COALESCE(o.discount_amount, 0)), 2)"
+      default_filters:
+        - "LOWER(COALESCE(o.order_status, o.status)) IN ('delivered', 'completed')"
+
+    - name: average_order_value
+      description: "Average net spend per completed purchase."
+      sql_expression: "ROUND(SUM(COALESCE(o.order_value, o.total_amount, 0) - COALESCE(o.discount_amount, 0)) / NULLIF(COUNT(DISTINCT o.order_id), 0), 2)"
+      default_filters:
+        - "LOWER(COALESCE(o.order_status, o.status)) IN ('delivered', 'completed')"
+
+    - name: total_volume
+      description: "Total number of completed orders."
+      sql_expression: "COUNT(DISTINCT o.order_id)"
+      default_filters:
+        - "LOWER(COALESCE(o.order_status, o.status)) IN ('delivered', 'completed')"
+
+  entity_synonyms:
+    prime_members: "c.is_prime = true"
+    completed_orders: "LOWER(COALESCE(o.order_status, o.status)) IN ('delivered', 'completed')"
+    high_engagement_tracks: "s.user_rating >= 4.5 AND s.play_duration_seconds >= 180"
+
+  domain_join_rules:
+    - rule: "When analyzing orders and customers, join on customer_id."
+    - rule: "When analyzing e-commerce order line items, join orders and order_items on order_id, and order_items and products on product_id."
+    - rule: "Always alias tables cleanly (e.g., c for customers, o for orders, s for spotify)."
