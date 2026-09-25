@@ -1,30 +1,20 @@
-version: 1
-semantic_layer:
-  metrics:
-    - name: net_revenue
-      description: "Total net monetary value from completed transactions after deducting discounts."
-      sql_expression: "ROUND(SUM(COALESCE(o.order_value, o.total_amount, 0) - COALESCE(o.discount_amount, 0)), 2)"
-      default_filters:
-        - "LOWER(COALESCE(o.order_status, o.status)) IN ('delivered', 'completed')"
+metrics:
+  net_revenue:
+    description: "Actual realized revenue after coupons and discounts for fulfilled orders"
+    formula: "SUM(o.order_value - COALESCE(o.discount_amount, 0))"
+    table: "zomato_orders o"
+    default_filter: "o.order_status = 'delivered' AND o.payment_status = 'completed'"
 
-    - name: average_order_value
-      description: "Average net spend per completed purchase."
-      sql_expression: "ROUND(SUM(COALESCE(o.order_value, o.total_amount, 0) - COALESCE(o.discount_amount, 0)) / NULLIF(COUNT(DISTINCT o.order_id), 0), 2)"
-      default_filters:
-        - "LOWER(COALESCE(o.order_status, o.status)) IN ('delivered', 'completed')"
+  gross_merchandise_value:
+    description: "Total order value before discounts"
+    formula: "SUM(o.order_value)"
+    table: "zomato_orders o"
 
-    - name: total_volume
-      description: "Total number of completed orders."
-      sql_expression: "COUNT(DISTINCT o.order_id)"
-      default_filters:
-        - "LOWER(COALESCE(o.order_status, o.status)) IN ('delivered', 'completed')"
+  active_customers:
+    description: "Customers who have placed at least one delivered order"
+    condition: "customer_id IN (SELECT DISTINCT customer_id FROM zomato_orders WHERE order_status = 'delivered')"
 
-  entity_synonyms:
-    prime_members: "c.is_prime = true"
-    completed_orders: "LOWER(COALESCE(o.order_status, o.status)) IN ('delivered', 'completed')"
-    high_engagement_tracks: "s.user_rating >= 4.5 AND s.play_duration_seconds >= 180"
-
-  domain_join_rules:
-    - rule: "When analyzing orders and customers, join on customer_id."
-    - rule: "When analyzing e-commerce order line items, join orders and order_items on order_id, and order_items and products on product_id."
-    - rule: "Always alias tables cleanly (e.g., c for customers, o for orders, s for spotify)."
+synonyms:
+  prime_users: "is_prime = true"
+  cancelled: "order_status IN ('cancelled', 'failed')"
+  successful_orders: "order_status = 'delivered'"

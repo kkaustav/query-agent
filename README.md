@@ -284,27 +284,61 @@ WHERE rank_num = 1;
 
 ## Enterprise Production Roadmap
 
-The following architectural components represent the planned progression from a single-tenant analytics agent to a high-scale enterprise platform:
+- [x] **Lightweight Semantic Metric Layer:** Standardized YAML metric definitions ensuring consistent revenue and KPI formulas across natural language inquiries.
+- [ ] **Two-Stage Semantic Schema Pruning:** Vector-retrieving candidate table sub-schemas via Amazon Titan to scale across 100+ Glue tables without context blowouts.
+- [ ] **Semantic Query Vector Cache:** Sub-100ms response caching for recurring analytical queries using in-memory cosine similarity gating.
+- [ ] **Pre-Flight AST Partition Enforcement:** Automated query rewrite injecting mandatory partition limits prior to Athena execution to guarantee zero runaway cloud bills.
+- [ ] **Lake Formation Column/Row-Level Security:** Centralized PII masking and tenant isolation propagated via AWS Lake Formation policies.
 
-### 1. Two-Stage Semantic Schema Pruning (100+ Table Scale)
-* **Problem:** Feeding exhaustive Glue catalog DDLs for hundreds of tables creates context bloat, increases Bedrock latency, and degrades SQL generation accuracy.
-* **Solution:** Vectorize table and column metadata using Amazon Titan Text Embeddings v2. Query arrival triggers semantic retrieval of only the top 3–5 candidate tables, passing a pruned sub-schema into Nova Pro.
+---
 
-### 2. Semantic Query Caching (Sub-100ms / $0.00 Scans)
-* **Problem:** Analysts frequently submit identical inquiries with slight phrasing variations.
-* **Solution:** In-memory vector cache storing query embeddings and S3 result metadata. Queries matching existing embeddings at cosine similarity $> 0.96$ return staged Athena result sets immediately, cutting Bedrock token charges and Athena S3 scans to $0.00.
+## Data Catalog & Dynamic Schema Engine (`query_agent_db`)
 
-### 3. Pre-Flight Cost & Scan Estimation (EXPLAIN Gating)
-* **Problem:** Runaway queries omitting partition filters on multi-terabyte unpartitioned tables risk substantial scan charges ($5/TB).
-* **Solution:** Pre-execution dry-run inspecting `EXPLAIN (TYPE DISTRIBUTED)` output and AST partition clauses. Automatically halts execution or injects bounded partition predicates if full-table scans exceed safety thresholds.
+The platform supports both delimited text files and columnar Parquet tables:
 
-### 4. Automated CI/CD Regression Benchmark Pipeline
-* **Problem:** Model prompt tweaks can introduce silent SQL dialect regressions.
-* **Solution:** A GitHub Actions test suite running 50 golden queries against an ephemeral Athena workgroup on pull requests, scoring syntax execution rates, semantic DataFrame validity, and token cost regressions.
+### Baseline Delimited E-Commerce Tables (Textfile)
+```sql
+CREATE EXTERNAL TABLE query_agent_db.customers (
+    customer_id INT,
+    name STRING,
+    email STRING,
+    country STRING,
+    created_at STRING
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+LOCATION 's3://query-agent-lake-<account_id>/data/customers/'
+TBLPROPERTIES ('skip.header.line.count'='1');
 
-### 5. Identity Propagation & Row-Level Governance (AWS Lake Formation)
-* **Problem:** Monolithic IAM Task Role access provides identical data visibility to all users.
-* **Solution:** Integrate AWS Lake Formation with session-based identity pass-through. Restricts PII columns (customer emails, phone numbers) for marketing roles while maintaining visibility for authorized analytical roles.
+CREATE EXTERNAL TABLE query_agent_db.orders (
+    order_id INT,
+    customer_id INT,
+    order_date STRING,
+    status STRING,
+    total_amount DOUBLE
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+STORED AS TEXTFILE
+LOCATION 's3://query-agent-lake-<account_id>/data/orders/'
+TBLPROPERTIES ('skip.header.line.count'='1');
+```
+
+### Columnar High-Performance Format (Apache Parquet)
+```sql
+CREATE EXTERNAL TABLE query_agent_db.spotify (
+    track_id BIGINT,
+    track_name STRING,
+    artist STRING,
+    genre STRING,
+    user_rating DOUBLE,
+    play_duration_seconds INT
+)
+STORED AS PARQUET
+LOCATION 's3://query-agent-lake-<account_id>/data/spotify/'
+TBLPROPERTIES ('parquet.compression'='SNAPPY');
+```
 
 ---
 
