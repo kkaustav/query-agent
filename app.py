@@ -188,9 +188,10 @@ with st.sidebar:
     st.markdown(
         """
         <div class="badge-box">
-            <b>Storage Limit:</b> Up to <b>4 TB</b> per dataset<br/>
+            <b>Storage Limit:</b> Up to <b>1 GB</b> per dataset (UI Ingestion)<br/>
             <b>Allowed Formats:</b> CSV, TSV, XLSX, XLS, PARQUET<br/>
-            <b>Batch Support:</b> Select 10+ files simultaneously
+            <b>Batch Support:</b> Select 10+ files simultaneously<br/>
+            <span style="opacity: 0.75; font-size: 0.74rem;">Direct S3 Multipart ingestion for &gt; 1 GB</span>
         </div>
         """,
         unsafe_allow_html=True
