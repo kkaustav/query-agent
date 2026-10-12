@@ -35,6 +35,34 @@ except ImportError:
         def get_advice(self, sql: str, df: Optional[pd.DataFrame] = None) -> Optional[str]:
             return None
 
+# --- Retroactive Class Patches (cures any cached in-memory instances) ---
+def _safe_examples_compat(self, *args, **kwargs):
+    for name in ["get_examples", "get_similar_examples", "search", "get_similar", "find_similar"]:
+        fn = getattr(self, name, None)
+        if callable(fn) and fn != _safe_examples_compat:
+            try:
+                return fn(*args, **kwargs)
+            except Exception:
+                pass
+    if hasattr(self, "examples") and isinstance(self.examples, list):
+        return self.examples[:3]
+    return []
+
+ExampleStore.get_similar_examples = _safe_examples_compat
+ExampleStore.get_examples = _safe_examples_compat
+
+def _safe_advisor_compat(self, *args, **kwargs):
+    for name in ["get_advice", "advise", "recommend", "analyze"]:
+        fn = getattr(self, name, None)
+        if callable(fn) and fn != _safe_advisor_compat:
+            try:
+                return fn(*args, **kwargs)
+            except Exception:
+                pass
+    return None
+
+IndexAdvisor.get_advice = _safe_advisor_compat
+
 
 def get_semantic_context() -> str:
     """Reads business formulas, metrics, and synonyms from metrics.yaml wrapped in XML tags."""
@@ -87,7 +115,6 @@ class NLQueryAgent:
         session = boto3.Session(**session_kwargs)
         self.bedrock = session.client("bedrock-runtime")
 
-        # Initialize helper modules with bedrock client fallbacks
         try:
             self.example_store = ExampleStore(self.bedrock)
         except Exception:
@@ -105,60 +132,20 @@ class NLQueryAgent:
                 self.advisor = None
 
     def _get_examples(self, query: str) -> List[Dict[str, str]]:
-        """Safely retrieves few-shot examples across common method names and signatures."""
         if not hasattr(self, "example_store") or not self.example_store:
             return []
-
-        method_names = [
-            "get_examples",
-            "get_similar_examples",
-            "get_similar",
-            "find_similar",
-            "get_relevant_examples",
-            "search",
-            "similarity_search",
-        ]
-        for name in method_names:
-            method = getattr(self.example_store, name, None)
-            if callable(method):
-                for call_attempt in [
-                    lambda: method(query, k=3),
-                    lambda: method(query, top_k=3),
-                    lambda: method(query, 3),
-                    lambda: method(query),
-                ]:
-                    try:
-                        res = call_attempt()
-                        if isinstance(res, list):
-                            return res
-                    except Exception:
-                        continue
-
-        if hasattr(self.example_store, "examples") and isinstance(self.example_store.examples, list):
-            return self.example_store.examples[:3]
-
-        return []
+        try:
+            return self.example_store.get_similar_examples(query)
+        except Exception:
+            return []
 
     def _get_index_advice(self, sql: str, df: Optional[pd.DataFrame] = None) -> Optional[str]:
-        """Safely fetches optimization advice across common method names."""
         if not hasattr(self, "advisor") or not self.advisor:
             return None
-
-        method_names = ["get_advice", "advise", "get_recommendations", "recommend", "analyze"]
-        for name in method_names:
-            method = getattr(self.advisor, name, None)
-            if callable(method):
-                for call_attempt in [
-                    lambda: method(sql, df),
-                    lambda: method(sql),
-                ]:
-                    try:
-                        res = call_attempt()
-                        if res:
-                            return str(res)
-                    except Exception:
-                        continue
-        return None
+        try:
+            return self.advisor.get_advice(sql, df)
+        except Exception:
+            return None
 
     def _build_system_prompt(self, schema: str, examples: List[Dict[str, str]]) -> str:
         prompt = (
