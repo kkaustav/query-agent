@@ -2,7 +2,7 @@
 
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://query-agent.streamlit.app/)
 [![AWS ECS Live](https://img.shields.io/badge/AWS%20ECS-Fargate%20Live-orange?logo=amazon-aws)](https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/)
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
 [![Amazon Bedrock](https://img.shields.io/badge/Amazon%20Bedrock-Nova%20Pro-792EE5)](https://aws.amazon.com/bedrock/)
 [![Amazon Athena](https://img.shields.io/badge/Amazon%20Athena-Serverless%20Trino-232F3E)](https://aws.amazon.com/athena/)
 [![Amazon S3](https://img.shields.io/badge/Amazon%20S3-Data%20Lake-569A31)](https://aws.amazon.com/s3/)
@@ -12,8 +12,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 *Live Deployments:*
-- **Primary (Always Online):** [https://query-agent.streamlit.app/](https://query-agent.streamlit.app/)
-- **Enterprise AWS Production (ECS Fargate + ALB):** [https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/](https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/) *(Note: The AWS ECS Fargate task is scaled to 0 tasks when idle to optimize cloud costs; spin up to 1 task on-demand via the AWS CLI).*
+- **Primary (Always Online):** https://query-agent.streamlit.app/
+- **Enterprise AWS Production (ECS Fargate + ALB):** https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/ *(Note: The AWS ECS Fargate task is scaled to 0 tasks when idle to optimize cloud costs; spin up to 1 task on-demand via the AWS CLI).*
 
 An enterprise-grade, serverless Text-to-SQL conversational analytics platform and **Autonomous Cloud FinOps Intelligence Engine**. Translates natural language inquiries into Trino/Presto SQL, enforces a declarative business semantic metric layer, validates query safety via Abstract Syntax Tree (AST) parsing, executes distributed queries over an Amazon S3 data lake using Amazon Athena, dynamically catalogs schemas via the AWS Glue Data Catalog, and provisions interactive Plotly visualizations paired with **prescriptive FinOps cloud cost optimization playbooks**.
 
@@ -360,7 +360,7 @@ query-agent/
 
 ### 1. Clone & Setup Environment
 ```bash
-git clone https://github.com/kkaustav/query-agent.git
+git clone [https://github.com/kkaustav/query-agent.git](https://github.com/kkaustav/query-agent.git)
 cd query-agent
 
 python3 -m venv .venv
@@ -402,8 +402,8 @@ aws ecr get-login-password --region ${REGION} | docker login --username AWS --pa
 
 # Build for linux/amd64 and push
 docker build --platform linux/amd64 -t query-agent:latest .
-docker tag query-agent:latest ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/query-agent:latest
-docker push ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/query-agent:latest
+docker tag query-agent:latest ${ACCOUNT_ID}.dkr.ecr.${REGION}[.amazonaws.com/query-agent:latest](https://.amazonaws.com/query-agent:latest)
+docker push ${ACCOUNT_ID}.dkr.ecr.${REGION}[.amazonaws.com/query-agent:latest](https://.amazonaws.com/query-agent:latest)
 
 # Trigger zero-downtime rolling deployment
 aws ecs update-service --cluster default --service query-agent --force-new-deployment --region ${REGION}
