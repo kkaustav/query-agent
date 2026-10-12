@@ -2,7 +2,6 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
 import boto3
 import pandas as pd
 import yaml
@@ -86,11 +85,11 @@ class NLQueryAgent:
         session = boto3.Session(**session_kwargs)
         self.bedrock = session.client("bedrock-runtime")
 
-        self.example_store = ExampleStore(
-            aws_access_key=aws_access_key,
-            aws_secret_key=aws_secret_key,
-            aws_region=aws_region
-        )
+        try:
+            self.example_store = ExampleStore()
+        except TypeError:
+            self.example_store = ExampleStore(session=session)
+
         self.advisor = IndexAdvisor()
 
     def _build_system_prompt(self, schema: str, examples: List[Dict[str, str]]) -> str:
@@ -147,7 +146,7 @@ class NLQueryAgent:
 
         messages: List[Dict[str, Any]] = []
 
-        # Incorporate prior chat turns
+        # Incorporate prior chat turns if history exists
         if history:
             for turn in history[-3:]:
                 messages.append({"role": "user", "content": [{"text": turn["question"]}]})
@@ -194,7 +193,6 @@ class NLQueryAgent:
 
         # Storage and partition advice based on final query
         index_rec = self.advisor.get_advice(final_sql, df)
-
         return df, final_sql, trace, examples, index_rec
 
     def summarize_results(self, natural_query: str, sql: str, df_preview: str) -> str:
@@ -207,7 +205,6 @@ class NLQueryAgent:
             "Provide a concise, data-driven executive summary (2-3 sentences max). "
             "Highlight key totals, top performers, percentages, or anomalies directly."
         )
-
         try:
             response = self.bedrock.converse(
                 modelId=self.model,
