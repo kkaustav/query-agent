@@ -35,7 +35,7 @@ except ImportError:
         def get_advice(self, sql: str, df: Optional[pd.DataFrame] = None) -> Optional[str]:
             return None
 
-# --- Retroactive Class Patches (cures any cached in-memory instances) ---
+# Retroactive class monkey-patching for seamless backwards compatibility
 def _safe_examples_compat(self, *args, **kwargs):
     for name in ["get_examples", "get_similar_examples", "search", "get_similar", "find_similar"]:
         fn = getattr(self, name, None)
@@ -93,7 +93,7 @@ def clean_sql_output(raw_output: str) -> str:
 
 
 class NLQueryAgent:
-    """Autonomous Text-to-SQL agent powered by Amazon Nova Pro and Amazon Athena."""
+    """Autonomous Text-to-SQL & FinOps Analytics agent powered by Amazon Nova Pro and Amazon Athena."""
 
     def __init__(
         self,
@@ -222,13 +222,13 @@ class NLQueryAgent:
             sql = clean_sql_output(raw_response)
             final_sql = sql
 
-            # 1. AST Read-Only Sanitization Guardrail
+            # AST Read-Only Sanitization Guardrail
             if not is_read_only_query(sql):
                 err_msg = "Security violation: AST query sanitizer rejected non-SELECT or destructive statement."
                 trace.append({"attempt": attempt, "status": "cost_exceeded", "error": err_msg})
                 raise PermissionError(err_msg)
 
-            # 2. Athena Execution
+            # Athena Execution
             try:
                 df = self.db_manager.execute_query(sql)
                 trace.append({"attempt": attempt, "status": "success", "error": None})
@@ -252,21 +252,42 @@ class NLQueryAgent:
         return df, final_sql, trace, examples, index_rec
 
     def summarize_results(self, natural_query: str, sql: str, df_preview: str) -> str:
-        """Synthesizes executive insights and business summaries from execution results."""
-        prompt = (
-            "You are an executive business intelligence advisor.\n"
-            f"User Question: {natural_query}\n"
-            f"Executed Athena SQL: {sql}\n"
-            f"Query Results (Preview):\n{df_preview}\n\n"
-            "Provide a concise, data-driven executive summary (2-3 sentences max). "
-            "Highlight key totals, top performers, percentages, or anomalies directly."
+        """Synthesizes executive insights, root cause analysis, and actionable FinOps optimization guidance."""
+        system_instruction = (
+            "You are a Principal Cloud FinOps Architect and AWS Cost Optimization Specialist. "
+            "Your role is to analyze cloud billing and usage data, explain the underlying technical drivers, "
+            "and provide decisive, high-impact AWS cost optimization advice."
         )
+
+        finops_prompt = f"""User Question: {natural_query}
+Executed Athena SQL: {sql}
+Query Results Preview:
+{df_preview}
+
+Please provide a structured, executive-ready response adhering to this format:
+
+### 📊 Spend & Trend Analysis
+- State the direct answer to the user inquiry with exact dollar amounts, dates, and percentages.
+- Identify any noticeable spikes, trends, or cost concentrations.
+
+### 🔍 Root Cause Diagnosis
+- Explain the technical reasons behind these numbers (e.g., month-start commitment fee amortization, snapshot scheduling, untagged non-production compute, oversized database instances, or end-of-month batch pipelines).
+
+### 💡 FinOps Recommendations & Cost Optimization
+Provide 2 to 4 concrete, actionable AWS engineering and procurement fixes:
+1. **Immediate Waste Elimination**: (e.g., stopping non-prod environments outside business hours via AWS Instance Scheduler, deleting unattached EBS volumes or obsolete snapshots).
+2. **Commitment & Pricing Model Tuning**: (e.g., Compute Savings Plans, EC2 Instance Savings Plans, or transitioning On-Demand instances to Spot for fault-tolerant workers).
+3. **Architectural Rightsizing & Modernization**: (e.g., downsizing overprovisioned instance types, migrating from x86 to AWS Graviton processors, migrating GP2 to GP3 EBS volumes).
+4. **Governance & Anomaly Alerting**: (e.g., configuring AWS Cost Anomaly Detection with SNS alerts, enforcing tag-or-terminate policies).
+"""
+
         try:
             response = self.bedrock.converse(
                 modelId=self.model,
-                messages=[{"role": "user", "content": [{"text": prompt}]}],
-                inferenceConfig={"temperature": 0.2, "maxTokens": 300}
+                messages=[{"role": "user", "content": [{"text": finops_prompt}]}],
+                system=[{"text": system_instruction}],
+                inferenceConfig={"temperature": 0.2, "maxTokens": 2048}
             )
             return response["output"]["message"]["content"][0]["text"].strip()
         except Exception as e:
-            return f"Analysis completed. (Automated summary unavailable: {e})"
+            return f"Analysis completed. (FinOps advisory synthesis unavailable: {e})"
