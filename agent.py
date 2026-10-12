@@ -23,13 +23,15 @@ except ImportError:
     class ExampleStore:
         def __init__(self, *args, **kwargs):
             pass
-        def get_similar_examples(self, query: str, k: int = 3) -> List[Dict[str, str]]:
+        def get_examples(self, *args, **kwargs) -> List[Dict[str, str]]:
             return []
 
 try:
     from index_advisor import IndexAdvisor
 except ImportError:
     class IndexAdvisor:
+        def __init__(self, *args, **kwargs):
+            pass
         def get_advice(self, sql: str, df: Optional[pd.DataFrame] = None) -> Optional[str]:
             return None
 
@@ -85,9 +87,78 @@ class NLQueryAgent:
         session = boto3.Session(**session_kwargs)
         self.bedrock = session.client("bedrock-runtime")
 
-        # ExampleStore expects the initialized Bedrock client
-        self.example_store = ExampleStore(self.bedrock)
-        self.advisor = IndexAdvisor(self.bedrock)
+        # Initialize helper modules with bedrock client fallbacks
+        try:
+            self.example_store = ExampleStore(self.bedrock)
+        except Exception:
+            try:
+                self.example_store = ExampleStore()
+            except Exception:
+                self.example_store = None
+
+        try:
+            self.advisor = IndexAdvisor(self.bedrock)
+        except Exception:
+            try:
+                self.advisor = IndexAdvisor()
+            except Exception:
+                self.advisor = None
+
+    def _get_examples(self, query: str) -> List[Dict[str, str]]:
+        """Safely retrieves few-shot examples across common method names and signatures."""
+        if not hasattr(self, "example_store") or not self.example_store:
+            return []
+
+        method_names = [
+            "get_examples",
+            "get_similar_examples",
+            "get_similar",
+            "find_similar",
+            "get_relevant_examples",
+            "search",
+            "similarity_search",
+        ]
+        for name in method_names:
+            method = getattr(self.example_store, name, None)
+            if callable(method):
+                for call_attempt in [
+                    lambda: method(query, k=3),
+                    lambda: method(query, top_k=3),
+                    lambda: method(query, 3),
+                    lambda: method(query),
+                ]:
+                    try:
+                        res = call_attempt()
+                        if isinstance(res, list):
+                            return res
+                    except Exception:
+                        continue
+
+        if hasattr(self.example_store, "examples") and isinstance(self.example_store.examples, list):
+            return self.example_store.examples[:3]
+
+        return []
+
+    def _get_index_advice(self, sql: str, df: Optional[pd.DataFrame] = None) -> Optional[str]:
+        """Safely fetches optimization advice across common method names."""
+        if not hasattr(self, "advisor") or not self.advisor:
+            return None
+
+        method_names = ["get_advice", "advise", "get_recommendations", "recommend", "analyze"]
+        for name in method_names:
+            method = getattr(self.advisor, name, None)
+            if callable(method):
+                for call_attempt in [
+                    lambda: method(sql, df),
+                    lambda: method(sql),
+                ]:
+                    try:
+                        res = call_attempt()
+                        if res:
+                            return str(res)
+                    except Exception:
+                        continue
+        return None
 
     def _build_system_prompt(self, schema: str, examples: List[Dict[str, str]]) -> str:
         prompt = (
@@ -110,9 +181,14 @@ class NLQueryAgent:
         if examples:
             prompt += "\nREFERENCE GOLDEN SQL EXAMPLES:\n"
             for eg in examples:
-                q = eg.get("question") or eg.get("query", "")
-                s = eg.get("sql", "")
-                prompt += f"- Question: {q}\n  SQL: {s}\n"
+                if isinstance(eg, dict):
+                    q = eg.get("question") or eg.get("query", "")
+                    s = eg.get("sql", "")
+                else:
+                    q = getattr(eg, "question", "") or getattr(eg, "query", "")
+                    s = getattr(eg, "sql", "") or str(eg)
+                if q or s:
+                    prompt += f"- Question: {q}\n  SQL: {s}\n"
 
         return prompt
 
@@ -137,7 +213,7 @@ class NLQueryAgent:
     ) -> Tuple[pd.DataFrame, str, List[Dict[str, Any]], List[Dict[str, str]], Optional[str]]:
         """Synthesizes SQL, sanitizes queries via AST, executes against Athena, and repairs errors autonomously."""
         schema = self.db_manager.get_schema()
-        examples = self.example_store.get_similar_examples(natural_query, k=3)
+        examples = self._get_examples(natural_query)
         system_prompt = self._build_system_prompt(schema, examples)
 
         messages: List[Dict[str, Any]] = []
@@ -159,11 +235,13 @@ class NLQueryAgent:
             sql = clean_sql_output(raw_response)
             final_sql = sql
 
+            # 1. AST Read-Only Sanitization Guardrail
             if not is_read_only_query(sql):
                 err_msg = "Security violation: AST query sanitizer rejected non-SELECT or destructive statement."
                 trace.append({"attempt": attempt, "status": "cost_exceeded", "error": err_msg})
                 raise PermissionError(err_msg)
 
+            # 2. Athena Execution
             try:
                 df = self.db_manager.execute_query(sql)
                 trace.append({"attempt": attempt, "status": "success", "error": None})
@@ -183,7 +261,7 @@ class NLQueryAgent:
                 )
                 messages.append({"role": "user", "content": [{"text": correction_prompt}]})
 
-        index_rec = self.advisor.get_advice(final_sql, df)
+        index_rec = self._get_index_advice(final_sql, df)
         return df, final_sql, trace, examples, index_rec
 
     def summarize_results(self, natural_query: str, sql: str, df_preview: str) -> str:
