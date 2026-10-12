@@ -21,61 +21,60 @@ st.set_page_config(
 
 st.markdown(
     """
-    <style>
-    /* Suppress Streamlit's default dropzone instruction text and small limit tag */
-    [data-testid="stFileUploaderDropzoneInstructions"],
-    [data-testid="stFileUploader"] small {
-        display: none !important;
-    }
+<style>
+/* Suppress Streamlit's default dropzone instruction text and small limit tag */
+[data-testid="stFileUploaderDropzoneInstructions"],
+[data-testid="stFileUploader"] small {
+    display: none !important;
+}
 
-    /* Clean, full-width Upload / Browse button container */
-    [data-testid="stFileUploaderDropzone"] {
-        padding: 10px !important;
-        min-height: unset !important;
-        border: 1px dashed rgba(255, 255, 255, 0.25) !important;
-        background: transparent !important;
-    }
-    [data-testid="stFileUploaderDropzone"] button {
-        width: 100% !important;
-    }
+/* Clean, full-width Upload / Browse button container */
+[data-testid="stFileUploaderDropzone"] {
+    padding: 10px !important;
+    min-height: unset !important;
+    border: 1px dashed rgba(255, 255, 255, 0.25) !important;
+    background: transparent !important;
+}
+[data-testid="stFileUploaderDropzone"] button {
+    width: 100% !important;
+}
 
-    /* Format & limit specifications badge box */
-    .badge-box {
-        background-color: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 6px;
-        padding: 8px 12px;
-        margin-bottom: 10px;
-        font-size: 0.8rem;
-        line-height: 1.4;
-    }
+/* Format & limit specifications badge box */
+.badge-box {
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    font-size: 0.8rem;
+    line-height: 1.4;
+}
 
-    /* History links that open in new tabs */
-    a.history-tab-link {
-        display: block !important;
-        text-decoration: none !important;
-        color: #e0e0e0 !important;
-        background-color: rgba(255, 255, 255, 0.05) !important;
-        border: 1px solid rgba(255, 255, 255, 0.1) !important;
-        border-radius: 6px !important;
-        padding: 7px 10px !important;
-        margin-bottom: 6px !important;
-        font-size: 0.82rem !important;
-        white-space: nowrap !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        transition: all 0.2s ease !important;
-    }
-    a.history-tab-link:hover {
-        background-color: rgba(255, 255, 255, 0.12) !important;
-        border-color: rgba(255, 255, 255, 0.25) !important;
-        color: #ffffff !important;
-    }
-    </style>
-    """,
+/* History links that open in new tabs */
+a.history-tab-link {
+    display: block !important;
+    text-decoration: none !important;
+    color: #e0e0e0 !important;
+    background-color: rgba(255, 255, 255, 0.05) !important;
+    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    border-radius: 6px !important;
+    padding: 7px 10px !important;
+    margin-bottom: 6px !important;
+    font-size: 0.82rem !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    transition: all 0.2s ease !important;
+}
+a.history-tab-link:hover {
+    background-color: rgba(255, 255, 255, 0.12) !important;
+    border-color: rgba(255, 255, 255, 0.25) !important;
+    color: #ffffff !important;
+}
+</style>
+""",
     unsafe_allow_html=True
 )
-
 
 # ==============================================================================
 # 2. CREDENTIALS & ATHENA DATA LAKE CONFIGURATION
@@ -86,7 +85,6 @@ def get_secret(key: str, default=None):
         return st.secrets.get(key, os.getenv(key, default))
     except Exception:
         return os.getenv(key, default)
-
 
 aws_key = get_secret("AWS_ACCESS_KEY_ID")
 aws_secret = get_secret("AWS_SECRET_ACCESS_KEY")
@@ -108,7 +106,6 @@ except Exception:
 BUCKET_NAME = f"query-agent-lake-{account_id}"
 DATABASE_NAME = "query_agent_db"
 
-
 # ==============================================================================
 # 3. RESOURCE CACHING & ENGINE INITIALIZATION
 # ==============================================================================
@@ -120,8 +117,7 @@ def get_athena_engine(db_name: str, b_name: str, reg: str):
         region=reg
     )
 
-
-@st.cache_resource(show_spinner="Initializing Bedrock Nova Pro Agent Pipeline...")
+# Uncached so code updates in agent.py reflect immediately on each prompt
 def get_agent(key: str, secret: str, reg: str, model: str, _engine):
     return NLQueryAgent(
         aws_access_key=key if key else None,
@@ -131,20 +127,16 @@ def get_agent(key: str, secret: str, reg: str, model: str, _engine):
         db_manager=_engine
     )
 
-
 @st.cache_resource
 def get_shared_sessions():
     return {}
 
-
 shared_sessions = get_shared_sessions()
-
 
 # Export Helpers
 @st.cache_data
 def convert_df_to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
-
 
 @st.cache_data
 def convert_df_to_excel(df: pd.DataFrame) -> bytes:
@@ -152,7 +144,6 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Query_Results")
     return output.getvalue()
-
 
 try:
     db_manager = get_athena_engine(DATABASE_NAME, BUCKET_NAME, aws_region)
@@ -184,7 +175,6 @@ if "ingested_signatures" not in st.session_state:
 # ==============================================================================
 with st.sidebar:
     st.subheader("📂 S3 Data Lake Ingestion")
-
     st.markdown(
         """
         <div class="badge-box">
@@ -197,7 +187,6 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-    # Multi-file uploader accepting batch mixed file types
     uploaded_files = st.file_uploader(
         "Upload datasets directly to S3",
         type=["csv", "tsv", "xlsx", "xls", "parquet"],
@@ -209,13 +198,11 @@ with st.sidebar:
         current_signatures = {f"{f.name}_{f.size}" for f in uploaded_files}
         st.session_state.ingested_signatures = st.session_state.ingested_signatures.intersection(current_signatures)
 
-        # Filter out files not yet streamed to S3
         new_files = [f for f in uploaded_files if f"{f.name}_{f.size}" not in st.session_state.ingested_signatures]
 
         if new_files:
             success_count = 0
             failed_uploads = []
-
             progress_bar = st.progress(0, text="Initializing batch ingestion...")
 
             for idx, file_obj in enumerate(new_files):
@@ -232,7 +219,6 @@ with st.sidebar:
                     failed_uploads.append(f"{file_obj.name}: {err}")
 
             progress_bar.empty()
-
             if success_count > 0:
                 st.session_state["upload_toast"] = "Data uploaded successfully"
             if failed_uploads:
@@ -241,27 +227,26 @@ with st.sidebar:
             st.cache_resource.clear()
             st.rerun()
 
-    # Clean Pop-up Toast Alert (no bulky green banner)
     if "upload_toast" in st.session_state:
         st.toast(st.session_state.pop("upload_toast"), icon="✅")
+
     if "upload_error_banner" in st.session_state:
         st.error(st.session_state.pop("upload_error_banner"))
 
     st.markdown("---")
+
     with st.expander("Inspect Athena / Glue Schema", expanded=False):
         try:
             st.code(db_manager.get_schema(), language="sql")
         except Exception:
             st.caption("No tables registered in catalog yet.")
 
-    # Reset current session or start a fresh query
     if st.button("➕ New Chat / Reset", use_container_width=True):
         st.session_state.active_session_id = str(uuid.uuid4())[:8]
         st.session_state.messages = []
         st.query_params.clear()
         st.rerun()
 
-    # Browser-Style History: Opens in a New Tab
     st.markdown("---")
     st.subheader("🕒 Previous Chats")
     st.caption("Clicking opens the conversation in a new tab.")
@@ -271,7 +256,6 @@ with st.sidebar:
             is_active = (s_id == st.session_state.active_session_id)
             icon = "🟢 " if is_active else "💬 "
             display_title = f"{icon}{s_data['title']}"
-
             st.markdown(
                 f"""
                 <a class="history-tab-link" href="/?session={s_id}" target="_blank" title="Open '{s_data['title']}' in new tab">
@@ -307,13 +291,23 @@ for idx, msg in enumerate(st.session_state.messages):
                     st.dataframe(df, use_container_width=True)
                     bcol1, bcol2 = st.columns(2)
                     with bcol1:
-                        st.download_button("📄 CSV", convert_df_to_csv(df), f"export_{idx}.csv", "text/csv",
-                                           key=f"csv_{idx}", use_container_width=True)
+                        st.download_button(
+                            "📄 CSV",
+                            convert_df_to_csv(df),
+                            f"export_{idx}.csv",
+                            "text/csv",
+                            key=f"csv_{idx}",
+                            use_container_width=True
+                        )
                     with bcol2:
-                        st.download_button("📊 Excel", convert_df_to_excel(df), f"export_{idx}.xlsx",
-                                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                           key=f"xlsx_{idx}", use_container_width=True)
-
+                        st.download_button(
+                            "📊 Excel",
+                            convert_df_to_excel(df),
+                            f"export_{idx}.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"xlsx_{idx}",
+                            use_container_width=True
+                        )
                 with col_right:
                     num_cols = df.select_dtypes(include=["number"]).columns.tolist()
                     cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
@@ -337,8 +331,9 @@ if user_query:
     st.chat_message("user").write(user_query)
 
     history_turns = [
-        {"question": m["prompt_ref"], "sql": m["sql"]}
-        for m in st.session_state.messages if m.get("role") == "assistant" and "sql" in m
+        {"question": m.get("prompt_ref", m.get("content", "")), "sql": m["sql"]}
+        for m in st.session_state.messages
+        if m.get("role") == "assistant" and "sql" in m
     ]
 
     with st.chat_message("assistant"):
@@ -349,7 +344,6 @@ if user_query:
                     history=history_turns,
                     max_retries=3
                 )
-
                 st.write(f"🔍 **Matched {len(examples)} reference SQL patterns via Titan vector search**")
                 for step in trace:
                     if step["status"] == "success":
@@ -358,9 +352,7 @@ if user_query:
                         st.write(f"🛑 **Attempt {step['attempt']} rejected by cost optimizer:** `{step['error']}`")
                     else:
                         st.write(f"⚠️ **Attempt {step['attempt']} corrected:** `{step['error']}`")
-
                 status_box.update(label="Query executed successfully!", state="complete", expanded=False)
-
             except Exception as e:
                 status_box.update(label="Athena execution failed", state="error", expanded=True)
                 st.error(f"Error: {e}")
@@ -376,13 +368,23 @@ if user_query:
                 st.dataframe(df, use_container_width=True)
                 bcol1, bcol2 = st.columns(2)
                 with bcol1:
-                    st.download_button("📄 CSV", convert_df_to_csv(df), f"export_{curr_idx}.csv", "text/csv",
-                                       key="csv_live", use_container_width=True)
+                    st.download_button(
+                        "📄 CSV",
+                        convert_df_to_csv(df),
+                        f"export_{curr_idx}.csv",
+                        "text/csv",
+                        key="csv_live",
+                        use_container_width=True
+                    )
                 with bcol2:
-                    st.download_button("📊 Excel", convert_df_to_excel(df), f"export_{curr_idx}.xlsx",
-                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                       key="xlsx_live", use_container_width=True)
-
+                    st.download_button(
+                        "📊 Excel",
+                        convert_df_to_excel(df),
+                        f"export_{curr_idx}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="xlsx_live",
+                        use_container_width=True
+                    )
             with col_right:
                 num_cols = df.select_dtypes(include=["number"]).columns.tolist()
                 cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
