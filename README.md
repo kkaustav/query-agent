@@ -26,12 +26,12 @@ Containerized with Docker, published to **Amazon ECR**, and hosted on **Amazon E
 ### 1. Autonomous Anomaly Detection & 3-Tier FinOps Diagnostics
 When prompted with: *"Find the top anomalies and provide me recommendations to resolve it"*, the agent autonomously identifies statistical outliers across services (such as $19,196.32 in Amazon EC2 and $3,900.10 in Compute Savings Plans), explains the underlying engineering root causes, and delivers actionable AWS cost-reduction playbooks:
 
-![FinOps Anomaly Diagnostics & Remediation](docs/images/finops_anomaly_advisory.png)
+![FinOps Anomaly Diagnostics & Remediation](https://drive.google.com/uc?export=view&id=1d5UdTjmkIIsKScxR-5Y0PSnl153eprkE)
 
 ### 2. Analytical Data Table & Interactive Anomaly Spend Visualization
 Athena serverless query execution isolates anomalous spend across AWS product codes, rendering an interactive Plotly bar chart and a 10-row dataset with instant CSV and Excel export options:
 
-![FinOps Anomaly Visualization & Results Table](docs/images/finops_anomaly_chart.png)
+![FinOps Anomaly Visualization & Results Table](https://drive.google.com/uc?export=view&id=1QTvDlm6B0fC67jauudbNmEjEM9smaR-x)
 
 ---
 
