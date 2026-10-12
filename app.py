@@ -117,7 +117,6 @@ def get_athena_engine(db_name: str, b_name: str, reg: str):
         region=reg
     )
 
-# Uncached so code updates in agent.py reflect immediately on each prompt
 def get_agent(key: str, secret: str, reg: str, model: str, _engine):
     return NLQueryAgent(
         aws_access_key=key if key else None,
@@ -281,9 +280,11 @@ for idx, msg in enumerate(st.session_state.messages):
         if msg["role"] == "user":
             st.write(msg["content"])
         elif msg["role"] == "assistant":
-            st.markdown("**Generated Athena SQL:**")
-            st.code(msg["sql"], language="sql")
+            # 1. Natural Language Response Front and Center
+            if msg.get("summary"):
+                st.markdown(msg["summary"])
 
+            # 2. Data Preview and Charts
             df = msg.get("df")
             if isinstance(df, pd.DataFrame) and not df.empty:
                 col_left, col_right = st.columns([1, 1])
@@ -315,7 +316,10 @@ for idx, msg in enumerate(st.session_state.messages):
                         fig = px.bar(df, x=cat_cols[0], y=num_cols[0], title="Metric Breakdown")
                         st.plotly_chart(fig, use_container_width=True, key=f"chart_{idx}")
 
-            st.markdown(f"**Insight:** {msg.get('summary', '')}")
+            # 3. Collapsible SQL Query
+            if msg.get("sql"):
+                with st.expander("🔍 View Athena SQL Query", expanded=False):
+                    st.code(msg["sql"], language="sql")
 
 # ==============================================================================
 # 7. USER INPUT & QUERY EXECUTION PIPELINE
@@ -358,9 +362,13 @@ if user_query:
                 st.error(f"Error: {e}")
                 st.stop()
 
-        st.markdown("**Generated Athena SQL:**")
-        st.code(final_sql, language="sql")
+        # 1. Synthesize and Display Natural Language Response First
+        with st.spinner("Synthesizing answer..."):
+            df_preview = df.head(10).to_string() if isinstance(df, pd.DataFrame) else str(df)
+            summary = agent.summarize_results(user_query, final_sql, df_preview)
+            st.markdown(summary)
 
+        # 2. Display Data Table & Charts
         curr_idx = len(st.session_state.messages)
         if isinstance(df, pd.DataFrame) and not df.empty:
             col_left, col_right = st.columns([1, 1])
@@ -392,10 +400,9 @@ if user_query:
                     fig = px.bar(df, x=cat_cols[0], y=num_cols[0], title="Metric Breakdown")
                     st.plotly_chart(fig, use_container_width=True, key="chart_live")
 
-        with st.spinner("Synthesizing answer..."):
-            df_preview = df.head(10).to_string() if isinstance(df, pd.DataFrame) else str(df)
-            summary = agent.summarize_results(user_query, final_sql, df_preview)
-            st.markdown(f"**Insight:** {summary}")
+        # 3. Collapsed SQL Expander at the Bottom
+        with st.expander("🔍 View Athena SQL Query", expanded=False):
+            st.code(final_sql, language="sql")
 
     st.session_state.messages.append({"role": "user", "content": user_query})
     st.session_state.messages.append({
