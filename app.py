@@ -22,13 +22,11 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-/* Suppress Streamlit's default dropzone instruction text and small limit tag */
 [data-testid="stFileUploaderDropzoneInstructions"],
 [data-testid="stFileUploader"] small {
     display: none !important;
 }
 
-/* Clean, full-width Upload / Browse button container */
 [data-testid="stFileUploaderDropzone"] {
     padding: 10px !important;
     min-height: unset !important;
@@ -39,7 +37,6 @@ st.markdown(
     width: 100% !important;
 }
 
-/* Format & limit specifications badge box */
 .badge-box {
     background-color: rgba(255, 255, 255, 0.05);
     border: 1px solid rgba(255, 255, 255, 0.12);
@@ -50,7 +47,6 @@ st.markdown(
     line-height: 1.4;
 }
 
-/* History links that open in new tabs */
 a.history-tab-link {
     display: block !important;
     text-decoration: none !important;
@@ -80,7 +76,6 @@ a.history-tab-link:hover {
 # 2. CREDENTIALS & ATHENA DATA LAKE CONFIGURATION
 # ==============================================================================
 def get_secret(key: str, default=None):
-    """Safely retrieves secrets without raising StreamlitSecretNotFoundError."""
     try:
         return st.secrets.get(key, os.getenv(key, default))
     except Exception:
@@ -132,7 +127,25 @@ def get_shared_sessions():
 
 shared_sessions = get_shared_sessions()
 
-# Export Helpers
+def unwrap_dataframe(data: any) -> pd.DataFrame:
+    """Safely extracts a pandas DataFrame from raw return objects (tuples, dicts)."""
+    if isinstance(data, pd.DataFrame):
+        return data
+    if isinstance(data, tuple) and len(data) > 0:
+        for item in data:
+            if isinstance(item, pd.DataFrame):
+                return item
+    if isinstance(data, dict):
+        for val in data.values():
+            if isinstance(val, pd.DataFrame):
+                return val
+    if isinstance(data, list):
+        try:
+            return pd.DataFrame(data)
+        except Exception:
+            pass
+    return pd.DataFrame()
+
 @st.cache_data
 def convert_df_to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
@@ -143,6 +156,52 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Query_Results")
     return output.getvalue()
+
+def render_data_and_charts(df: pd.DataFrame, key_prefix: str):
+    """Renders full table, export options, and automatic visual charts."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("ℹ️ The query executed successfully, but returned 0 rows from the database.")
+        return
+
+    st.markdown(f"### 📋 Query Results ({len(df):,} rows)")
+    st.dataframe(df, use_container_width=True)
+
+    bcol1, bcol2, _ = st.columns([1, 1, 4])
+    with bcol1:
+        st.download_button(
+            "📄 Export CSV",
+            convert_df_to_csv(df),
+            f"export_{key_prefix}.csv",
+            "text/csv",
+            key=f"csv_{key_prefix}",
+            use_container_width=True
+        )
+    with bcol2:
+        st.download_button(
+            "📊 Export Excel",
+            convert_df_to_excel(df),
+            f"export_{key_prefix}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"xlsx_{key_prefix}",
+            use_container_width=True
+        )
+
+    # Automatic Smart Charting
+    num_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    cat_cols = df.select_dtypes(include=["object", "string", "category"]).columns.tolist()
+    date_cols = [c for c in df.columns if any(term in c.lower() for term in ["date", "time", "day", "month", "year"])]
+
+    if num_cols and (cat_cols or date_cols):
+        st.markdown("### 📊 Data Visualization")
+        x_col = date_cols[0] if date_cols else cat_cols[0]
+        y_col = num_cols[0]
+
+        if date_cols and date_cols[0] == x_col and len(df) > 1:
+            fig = px.line(df, x=x_col, y=y_col, title=f"{y_col} Over {x_col}", markers=True)
+        else:
+            fig = px.bar(df, x=x_col, y=y_col, title=f"{y_col} by {x_col}")
+        
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_{key_prefix}")
 
 try:
     db_manager = get_athena_engine(DATABASE_NAME, BUCKET_NAME, aws_region)
@@ -280,41 +339,13 @@ for idx, msg in enumerate(st.session_state.messages):
         if msg["role"] == "user":
             st.write(msg["content"])
         elif msg["role"] == "assistant":
-            # 1. Natural Language Response Front and Center
+            # 1. Natural Language Response
             if msg.get("summary"):
                 st.markdown(msg["summary"])
 
-            # 2. Data Preview and Charts
-            df = msg.get("df")
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                col_left, col_right = st.columns([1, 1])
-                with col_left:
-                    st.dataframe(df, use_container_width=True)
-                    bcol1, bcol2 = st.columns(2)
-                    with bcol1:
-                        st.download_button(
-                            "📄 CSV",
-                            convert_df_to_csv(df),
-                            f"export_{idx}.csv",
-                            "text/csv",
-                            key=f"csv_{idx}",
-                            use_container_width=True
-                        )
-                    with bcol2:
-                        st.download_button(
-                            "📊 Excel",
-                            convert_df_to_excel(df),
-                            f"export_{idx}.xlsx",
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"xlsx_{idx}",
-                            use_container_width=True
-                        )
-                with col_right:
-                    num_cols = df.select_dtypes(include=["number"]).columns.tolist()
-                    cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
-                    if cat_cols and num_cols:
-                        fig = px.bar(df, x=cat_cols[0], y=num_cols[0], title="Metric Breakdown")
-                        st.plotly_chart(fig, use_container_width=True, key=f"chart_{idx}")
+            # 2. Full Table & Graphs
+            df = unwrap_dataframe(msg.get("df"))
+            render_data_and_charts(df, f"hist_{idx}")
 
             # 3. Collapsible SQL Query
             if msg.get("sql"):
@@ -343,11 +374,12 @@ if user_query:
     with st.chat_message("assistant"):
         with st.status("Agent reasoning & Athena execution pipeline...", expanded=True) as status_box:
             try:
-                df, final_sql, trace, examples, index_rec = agent.run_query_with_self_healing(
+                raw_df, final_sql, trace, examples, index_rec = agent.run_query_with_self_healing(
                     natural_query=user_query,
                     history=history_turns,
                     max_retries=3
                 )
+                df = unwrap_dataframe(raw_df)
                 st.write(f"🔍 **Matched {len(examples)} reference SQL patterns via Titan vector search**")
                 for step in trace:
                     if step["status"] == "success":
@@ -364,43 +396,15 @@ if user_query:
 
         # 1. Synthesize and Display Natural Language Response First
         with st.spinner("Synthesizing answer..."):
-            df_preview = df.head(10).to_string() if isinstance(df, pd.DataFrame) else str(df)
+            df_preview = df.head(10).to_string() if not df.empty else "No records returned"
             summary = agent.summarize_results(user_query, final_sql, df_preview)
             st.markdown(summary)
 
-        # 2. Display Data Table & Charts
+        # 2. Display Full Table and Auto-Charts
         curr_idx = len(st.session_state.messages)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            col_left, col_right = st.columns([1, 1])
-            with col_left:
-                st.dataframe(df, use_container_width=True)
-                bcol1, bcol2 = st.columns(2)
-                with bcol1:
-                    st.download_button(
-                        "📄 CSV",
-                        convert_df_to_csv(df),
-                        f"export_{curr_idx}.csv",
-                        "text/csv",
-                        key="csv_live",
-                        use_container_width=True
-                    )
-                with bcol2:
-                    st.download_button(
-                        "📊 Excel",
-                        convert_df_to_excel(df),
-                        f"export_{curr_idx}.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="xlsx_live",
-                        use_container_width=True
-                    )
-            with col_right:
-                num_cols = df.select_dtypes(include=["number"]).columns.tolist()
-                cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
-                if cat_cols and num_cols:
-                    fig = px.bar(df, x=cat_cols[0], y=num_cols[0], title="Metric Breakdown")
-                    st.plotly_chart(fig, use_container_width=True, key="chart_live")
+        render_data_and_charts(df, f"live_{curr_idx}")
 
-        # 3. Collapsed SQL Expander at the Bottom
+        # 3. Collapsed SQL Expander
         with st.expander("🔍 View Athena SQL Query", expanded=False):
             st.code(final_sql, language="sql")
 
