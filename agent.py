@@ -87,7 +87,7 @@ class NLQueryAgent:
 
         # ExampleStore expects the initialized Bedrock client
         self.example_store = ExampleStore(self.bedrock)
-        self.advisor = IndexAdvisor()
+        self.advisor = IndexAdvisor(self.bedrock)
 
     def _build_system_prompt(self, schema: str, examples: List[Dict[str, str]]) -> str:
         prompt = (
