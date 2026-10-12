@@ -85,11 +85,8 @@ class NLQueryAgent:
         session = boto3.Session(**session_kwargs)
         self.bedrock = session.client("bedrock-runtime")
 
-        try:
-            self.example_store = ExampleStore()
-        except TypeError:
-            self.example_store = ExampleStore(session=session)
-
+        # ExampleStore expects the initialized Bedrock client
+        self.example_store = ExampleStore(self.bedrock)
         self.advisor = IndexAdvisor()
 
     def _build_system_prompt(self, schema: str, examples: List[Dict[str, str]]) -> str:
@@ -106,7 +103,6 @@ class NLQueryAgent:
             f"ACTIVE ATHENA / GLUE DATABASE SCHEMAS:\n{schema}\n"
         )
 
-        # Inject business semantic layer rules into Bedrock prompt
         semantic_context = get_semantic_context()
         if semantic_context:
             prompt += f"\n{semantic_context}\n"
@@ -146,7 +142,6 @@ class NLQueryAgent:
 
         messages: List[Dict[str, Any]] = []
 
-        # Incorporate prior chat turns if history exists
         if history:
             for turn in history[-3:]:
                 messages.append({"role": "user", "content": [{"text": turn["question"]}]})
@@ -164,13 +159,11 @@ class NLQueryAgent:
             sql = clean_sql_output(raw_response)
             final_sql = sql
 
-            # 1. AST Read-Only Sanitization Guardrail
             if not is_read_only_query(sql):
                 err_msg = "Security violation: AST query sanitizer rejected non-SELECT or destructive statement."
                 trace.append({"attempt": attempt, "status": "cost_exceeded", "error": err_msg})
                 raise PermissionError(err_msg)
 
-            # 2. Athena Execution
             try:
                 df = self.db_manager.execute_query(sql)
                 trace.append({"attempt": attempt, "status": "success", "error": None})
@@ -182,7 +175,6 @@ class NLQueryAgent:
                 if attempt == max_retries:
                     raise RuntimeError(f"Execution failed after {max_retries} attempts. Last Athena error: {last_error}")
 
-                # Append error trace to context for self-healing reflection
                 messages.append({"role": "assistant", "content": [{"text": sql}]})
                 correction_prompt = (
                     f"Attempt {attempt} failed with the following database error:\n{last_error}\n\n"
@@ -191,7 +183,6 @@ class NLQueryAgent:
                 )
                 messages.append({"role": "user", "content": [{"text": correction_prompt}]})
 
-        # Storage and partition advice based on final query
         index_rec = self.advisor.get_advice(final_sql, df)
         return df, final_sql, trace, examples, index_rec
 
