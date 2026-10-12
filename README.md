@@ -24,12 +24,12 @@ Containerized with Docker, published to **Amazon ECR**, and hosted on **Amazon E
 ## 🖼️ FinOps Copilot in Action
 
 ### 1. Autonomous Anomaly Detection & 3-Tier FinOps Diagnostics
-When prompted with: *"Find the top anomalies and provide me recommendations to resolve it"*, the agent autonomously identifies statistical outliers across services (such as $19,196.32 in Amazon EC2 and $3,900.10 in Compute Savings Plans)[cite: 2], explains the underlying engineering root causes[cite: 2], and delivers actionable AWS cost-reduction playbooks[cite: 2]:
+When prompted with: *"Find the top anomalies and provide me recommendations to resolve it"*, the agent autonomously identifies statistical outliers across services (such as $19,196.32 in Amazon EC2 and $3,900.10 in Compute Savings Plans), explains the underlying engineering root causes, and delivers actionable AWS cost-reduction playbooks:
 
 ![FinOps Anomaly Diagnostics & Remediation](docs/images/finops_anomaly_advisory.png)
 
 ### 2. Analytical Data Table & Interactive Anomaly Spend Visualization
-Athena serverless query execution isolates anomalous spend across AWS product codes, rendering an interactive Plotly bar chart[cite: 1] and a 10-row dataset[cite: 1] with instant CSV and Excel export options[cite: 1]:
+Athena serverless query execution isolates anomalous spend across AWS product codes, rendering an interactive Plotly bar chart and a 10-row dataset with instant CSV and Excel export options:
 
 ![FinOps Anomaly Visualization & Results Table](docs/images/finops_anomaly_chart.png)
 
@@ -39,7 +39,7 @@ Athena serverless query execution isolates anomalous spend across AWS product co
 
 The platform decouples streaming data ingestion, semantic vector retrieval, AST query sanitation, serverless query execution, and conversational FinOps business intelligence:
 
-```
+```text
 [ User Browser / Client ]
            │
            ▼
@@ -69,13 +69,13 @@ The platform decouples streaming data ingestion, semantic vector retrieval, AST 
 ### 1. Autonomous Cloud FinOps & Cost Remediation Engine
 - **AWS CUR Ingestion & Schema Alignment:** Native understanding of AWS Cost and Usage Reports (CUR), dynamically mapping unblended/effective costs, usage types, operations, and pricing models (`On-Demand`, `Savings Plans`, `Spot`, `Reserved Instances`).
 - **3-Tier Executive FinOps Diagnostics:** Every cost and infrastructure inquiry automatically synthesizes:
-  1. 📊 **Spend & Trend Analysis:** Concrete dollar totals, MoM variances, and percentage spikes[cite: 2].
-  2. 🔍 **Root Cause Diagnosis:** Technical drivers behind anomalies (e.g., month-start recurring commitment fees, tax clumping, unamortized RIs, oversized dev/test compute, or month-end batch pipelines)[cite: 2].
-  3. 💡 **Prescriptive Cost Optimization:** Actionable AWS architectural and procurement fixes[cite: 2]:
-     - **Immediate Waste Elimination:** Automated non-prod scheduling via AWS Instance Scheduler, deletion of unattached EBS volumes, and obsolete snapshot cleanup[cite: 2].
-     - **Commitment Tuning:** Compute and EC2 Instance Savings Plans coverage optimization[cite: 2].
-     - **Modernization & Rightsizing:** Workload migration to AWS Graviton processors, GP2 to GP3 EBS transitions, and rightsizing idle nodes[cite: 2].
-     - **Governance:** Enforcing AWS Cost Anomaly Detection with SNS alerting and tag-or-terminate policies[cite: 2].
+  1. 📊 **Spend & Trend Analysis:** Concrete dollar totals, MoM variances, and percentage spikes.
+  2. 🔍 **Root Cause Diagnosis:** Technical drivers behind anomalies (e.g., month-start recurring commitment fees, tax clumping, unamortized RIs, oversized dev/test compute, or month-end batch pipelines).
+  3. 💡 **Prescriptive Cost Optimization:** Actionable AWS architectural and procurement fixes:
+     - **Immediate Waste Elimination:** Automated non-prod scheduling via AWS Instance Scheduler, deletion of unattached EBS volumes, and obsolete snapshot cleanup.
+     - **Commitment Tuning:** Compute and EC2 Instance Savings Plans coverage optimization.
+     - **Modernization & Rightsizing:** Workload migration to AWS Graviton processors, GP2 to GP3 EBS transitions, and rightsizing idle nodes.
+     - **Governance:** Enforcing AWS Cost Anomaly Detection with SNS alerting and tag-or-terminate policies.
 
 ### 2. Business Semantic Metric Layer (`metrics.yaml`)
 - Eliminates the primary failure mode of enterprise Text-to-SQL: business definition ambiguity.
@@ -266,6 +266,7 @@ WHERE rank_num = 1;
 The platform supports delimited text files, columnar Parquet tables, and multi-tenant AWS Cost & Usage Reports:
 
 ### AWS Cost & Usage Report Table (CUR)
+*Evaluation Dataset:* [Synthetic CUR Dataset - Aug/Sep 2026](https://drive.google.com/drive/u/0/folders/1VKXuPVwNDiVyaO3pzjG4AGIKEvSi_HZo)
 ```sql
 CREATE EXTERNAL TABLE query_agent_db.synthetic_cur_aug_sep_2026 (
     bill_payer_account_id bigint,
@@ -359,7 +360,7 @@ query-agent/
 
 ### 1. Clone & Setup Environment
 ```bash
-git clone [https://github.com/kkaustav/query-agent.git](https://github.com/kkaustav/query-agent.git)
+git clone https://github.com/kkaustav/query-agent.git
 cd query-agent
 
 python3 -m venv .venv
@@ -401,8 +402,8 @@ aws ecr get-login-password --region ${REGION} | docker login --username AWS --pa
 
 # Build for linux/amd64 and push
 docker build --platform linux/amd64 -t query-agent:latest .
-docker tag query-agent:latest ${ACCOUNT_ID}.dkr.ecr.${REGION}[.amazonaws.com/query-agent:latest](https://.amazonaws.com/query-agent:latest)
-docker push ${ACCOUNT_ID}.dkr.ecr.${REGION}[.amazonaws.com/query-agent:latest](https://.amazonaws.com/query-agent:latest)
+docker tag query-agent:latest ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/query-agent:latest
+docker push ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/query-agent:latest
 
 # Trigger zero-downtime rolling deployment
 aws ecs update-service --cluster default --service query-agent --force-new-deployment --region ${REGION}
