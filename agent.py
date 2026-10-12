@@ -110,7 +110,7 @@ class NLQueryAgent:
         session_kwargs = {"region_name": aws_region}
         if aws_access_key and aws_secret_key:
             session_kwargs["aws_access_key_id"] = aws_access_key
-            session_kwargs["aws_secret_access_key"] = aws_secret_key
+            session_kwargs["aws_secret_access_key"] = aws_secret_access_key
 
         session = boto3.Session(**session_kwargs)
         self.bedrock = session.client("bedrock-runtime")
@@ -157,7 +157,15 @@ class NLQueryAgent:
             "3. Do not append semicolons (;) at the end of the query.\n"
             "4. Cross-Table Joins: Inspect foreign keys in the schema carefully. Always qualify columns with explicit table aliases (e.g. c.customer_id).\n"
             "5. Dialect Rules: Use DATE 'YYYY-MM-DD', DATE_ADD, DATE_DIFF, or INTERVAL arithmetic. Avoid Postgres-specific operators like '::' or 'DISTINCT ON'.\n"
-            "6. Handle NULL values gracefully using COALESCE or NULLIF.\n\n"
+            "6. Handle NULL values gracefully using COALESCE or NULLIF.\n"
+            "7. AWS Cost & Usage Report (CUR) Semantic Rules:\n"
+            "   - Filtering AWS Services (e.g., EC2, S3, RDS, ELB, CloudWatch):\n"
+            "     ALWAYS filter using 'line_item_product_code' (e.g. 'AmazonEC2', 'AmazonS3', 'AmazonRDS', 'AWSELB')\n"
+            "     OR 'product_product_name' (e.g. 'Amazon Elastic Compute Cloud', 'Amazon Simple Storage Service').\n"
+            "   - NEVER filter 'product_instance_type' with service names like 'EC2%' or 'S3%'. That column only holds server sizes (e.g. 'm6i.large') and is NULL for storage/networking.\n"
+            "   - For spend/cost: Use 'line_item_unblended_cost'.\n"
+            "   - For daily spend trends or spikes: Group or filter by SUBSTR(line_item_usage_start_date, 1, 10).\n"
+            "   - Verify column semantics independently for each query rather than blindly reusing column filters from prior turns.\n\n"
             f"ACTIVE ATHENA / GLUE DATABASE SCHEMAS:\n{schema}\n"
         )
 
@@ -231,6 +239,20 @@ class NLQueryAgent:
             # Athena Execution
             try:
                 df = self.db_manager.execute_query(sql)
+
+                # Zero-Result Self-Healing Guardrail
+                if (df is None or df.empty) and attempt < max_retries:
+                    refinement_hint = (
+                        "The executed query returned 0 rows. Please verify your WHERE clause filters against the database schema:\n"
+                        "- If filtering for AWS services (EC2, S3, RDS, etc.), use line_item_product_code IN ('AmazonEC2', 'AmazonS3') or product_product_name, NEVER product_instance_type.\n"
+                        "- Ensure column values and string patterns match standard Athena conventions.\n"
+                        "Provide a corrected Presto/Trino SQL query that accurately filters and returns data."
+                    )
+                    trace.append({"attempt": attempt, "status": "empty_retry", "error": "Query returned 0 rows. Retrying with corrected schema filters."})
+                    messages.append({"role": "assistant", "content": [{"text": sql}]})
+                    messages.append({"role": "user", "content": [{"text": refinement_hint}]})
+                    continue
+
                 trace.append({"attempt": attempt, "status": "success", "error": None})
                 break
             except Exception as e:
