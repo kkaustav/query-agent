@@ -7,27 +7,86 @@
 [![Amazon Athena](https://img.shields.io/badge/Amazon%20Athena-Serverless%20Trino-232F3E)](https://aws.amazon.com/athena/)
 [![Amazon S3](https://img.shields.io/badge/Amazon%20S3-Data%20Lake-569A31)](https://aws.amazon.com/s3/)
 [![AWS Glue](https://img.shields.io/badge/AWS%20Glue-Data%20Catalog-blue)](https://aws.amazon.com/glue/)
-[![FinOps Certified](https://img.shields.io/badge/FinOps-Cloud%20Cost%20Intelligence-00C49F)](https://www.finops.org/)
+[![FinOps Cloud Cost Intelligence](https://img.shields.io/badge/FinOps-Cloud%20Cost%20Intelligence-00C49F)](https://www.finops.org/)
 [![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+> **From Data to Decisions — Without Writing SQL.**
+>
+> *Also known as the **NL BI FinOps Agent**.*
+
 *Live Deployments:*
 - **Primary (Always Online):** [https://query-agent.streamlit.app/](https://query-agent.streamlit.app/)
-- **Enterprise AWS Production (ECS Fargate + ALB):** [https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/](https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/) *(Note: The AWS ECS Fargate task is scaled to 0 tasks when idle to optimize cloud costs; spin up to 1 task on-demand via the AWS CLI).*
+- **AWS Deployment (ECS Fargate + ALB):** [https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/](https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/) *(Note: The AWS ECS Fargate task is scaled to 0 tasks when idle to optimize cloud costs; spin up to 1 task on-demand via the AWS CLI — see [On-Demand Service Control](#on-demand-service-control-cost-optimization)).*
 
-An enterprise-grade, serverless Text-to-SQL conversational analytics platform and **Autonomous Cloud FinOps Intelligence Engine**. Translates natural language inquiries into Trino/Presto SQL, enforces a declarative business semantic metric layer, validates query safety via Abstract Syntax Tree (AST) parsing, executes distributed queries over an Amazon S3 data lake using Amazon Athena, dynamically catalogs schemas via the AWS Glue Data Catalog, and provisions interactive Plotly visualizations paired with **prescriptive FinOps cloud cost optimization playbooks**.
+A serverless Text-to-SQL conversational analytics application and **FinOps copilot** built on an AWS data lakehouse. Users ask questions in plain English; the application translates them into Trino/Presto SQL, grounds the model in live AWS Glue schemas and a declarative business-metric layer (`metrics.yaml`), validates every query with Abstract Syntax Tree (AST) parsing so that only a single read-only `SELECT` runs, executes it on Amazon Athena over Amazon S3, and returns the generated SQL, an exportable result table and an interactive Plotly visualization. For AWS cost questions it adds a three-tier FinOps narrative — spend & trend analysis, potential root causes, and prescriptive optimization recommendations.
 
 Containerized with Docker, published to **Amazon ECR**, and hosted on **Amazon ECS on AWS Fargate** with managed ALB routing and keyless IAM Task Role authentication for **Amazon Bedrock**.
 
 ---
 
+## The Business Problem: Data Is Available, Insight Is Not
+
+Businesses often have the data they need but not an easy way to turn it into answers. Consider a monthly AWS Cost and Usage Report (CUR): a finance manager may simply want to know *why the bill increased, which services drove the change, and what can be done about it*. Getting there traditionally spans several tools, skill sets and hand-offs:
+
+```text
+S3 (store CUR files) → Glue (catalog tables) → Athena (write SQL) → BI tool (build visuals) → FinOps (interpret & act)
+```
+
+- **Tool configuration:** teams must connect and configure storage, metadata, query and visualization services (for example, an S3 → Glue → Athena → QuickSight pipeline with CUDOS dashboards).
+- **SQL and BI dependency:** every new question may require new SQL or a reconfigured chart or dashboard.
+- **Interpretation gap:** a chart shows *what* happened, not necessarily *why* it happened or *what to do next*.
+- **Slow hand-offs:** non-technical stakeholders wait on engineering or analytics teams.
+
+## The Solution: One Interface, One Request
+
+This application is an intelligent layer over the data platform. It does **not** replace S3, Glue or Athena — it orchestrates them and hides much of their technical complexity from the person asking the question.
+
+| Step | What happens |
+| :--- | :--- |
+| **1. Upload** | Add a CUR file or another supported dataset. |
+| **2. Ask** | Pose a question in plain English. |
+| **3. Analyze** | The application generates, validates and runs the SQL. |
+| **4. Understand** | Review the result table and interactive chart. |
+| **5. Act** | Read the FinOps narrative: candidate causes to investigate and optimization actions to consider. |
+
+**Example request:** *"My AWS bill increased significantly. Identify the top five services driving the increase, show the trend, explain possible causes and recommend ways to optimize spending."*
+
+The result is not just a chatbot reply but a **traceable analytical workflow**: the generated SQL, the result table and the visualization behind the explanation stay visible for review.
+
+**What makes it different**
+- **Accessibility:** business users ask questions in everyday language instead of learning SQL.
+- **End-to-end workflow:** ingestion, schema grounding, query generation, validation, execution and presentation are orchestrated in one application.
+- **Decision support:** cost answers go beyond totals to suggest possible drivers and optimization actions.
+- **Governance:** generated SQL is validated as read-only, and Athena workgroup limits help control scan cost.
+
+## Who It's For
+
+| User | Value provided |
+| :--- | :--- |
+| **Finance Manager** | Understand service-level spend, budget changes and cost drivers without writing SQL. |
+| **FinOps Analyst** | Investigate anomalies, identify optimization opportunities and prepare evidence-backed recommendations. |
+| **Cloud Architect / Engineer** | Inspect resource and usage patterns, query details and technical optimization opportunities. |
+| **Business Analyst** | Explore datasets, create tables and visualizations, and answer ad hoc questions more independently. |
+| **Engineering Manager** | Prioritize cost work using trends and potential impact areas. |
+| **Startup Founder** | Get a clearer view of cloud spend without building an analytics workflow for every question. |
+
+The application is not intended to replace the judgment of finance, FinOps or engineering professionals. It aims to make the first layer of analysis faster and more accessible, while keeping the query and result visible for review.
+
+---
+
 ## 🖼️ FinOps Copilot in Action
 
-### 1. Autonomous Anomaly Detection & 3-Tier Diagnostics
-When a user queries the agent (e.g., *"Find the top anomalies and provide me recommendations to resolve it"*), the system automatically detects statistical cost outliers. For example, it can identify unexpected spikes like $19,196.32 in Amazon EC2 or $3,900.10 in Compute Savings Plans. It then details the technical root causes behind these anomalies and generates an actionable playbook for AWS cost reduction.
+### 1. Anomaly Detection & 3-Tier Diagnostics
+Asked *"Find the top anomalies and provide me recommendations to resolve it"*, the application detects statistical cost outliers in the synthetic CUR (Aug/Sep 2026) and ranks ten AWS product codes by anomalous spend. The largest are **$19,196.32 in Amazon EC2** and **$3,900.10 in Compute Savings Plans**; together they account for **78.5%** of the **$29,408** of anomalous spend isolated in this case study. The response then lists candidate root causes for each service and an actionable playbook for AWS cost reduction.
 
-### 2. Analytical Data Tables & Interactive Visualization
-The platform leverages Athena's serverless query engine to isolate and analyze anomalous cloud spend across various AWS product codes. The output is presented via interactive Plotly bar charts and comprehensive data grids, complete with one-click export options for CSV and Excel.
+### 2. Daily Spend Trend & Spike Analysis
+Asked for September 2026 daily spend and its biggest spikes, the application returns a 30-row result and a time-series chart. **September 1 stands out at $12,724.09 — 451.72% above the average day** — and the narrative lists month-start commitment-fee amortization among the candidate causes to investigate.
+
+### 3. Analytical Data Tables & Interactive Visualization
+The platform leverages Athena's serverless query engine to isolate and analyze anomalous cloud spend across various AWS product codes. The output is presented via interactive Plotly charts and comprehensive data grids, complete with one-click export options for CSV and Excel.
+
+> These are demonstration results from a synthetic CUR dataset — not production customer findings or verified savings.
 
 ---
 
@@ -58,25 +117,48 @@ The platform decouples streaming data ingestion, semantic vector retrieval, AST 
                                           └─ Athena Staging (/athena-results/)
 ```
 
+### Core Components
+
+| Layer | Component | Responsibility |
+| :--- | :--- | :--- |
+| **Presentation** | Streamlit on ECS Fargate | Chat, uploads, result tables, Plotly charts and exports. |
+| **AI reasoning** | Amazon Bedrock Nova Pro | Natural-language understanding, SQL generation and FinOps narrative. |
+| **Semantic grounding** | `metrics.yaml` + Titan Text Embeddings v2 | Metric definitions, synonyms, default filters, schema context and relevant few-shot examples. |
+| **Safety** | `sqlglot` AST validation | Allows read-only `SELECT` queries; rejects destructive or multi-statement SQL. |
+| **Query engine** | Amazon Athena (Trino) | Executes validated queries over S3 with scan and time limits. |
+| **Metadata** | AWS Glue Data Catalog | Provides table and column schemas used to ground SQL generation. |
+| **Storage** | Amazon S3 data lakehouse | Stores uploaded datasets and Athena query outputs. |
+
+### How a Natural-Language Request Is Processed
+
+1. **Ask** — The user enters a question in the Streamlit chat.
+2. **Ground** — The agent retrieves Glue table schemas, metric formulas, synonyms, default filters and relevant examples.
+3. **Generate** — Bedrock Nova Pro writes Trino SQL and infers joins across tables.
+4. **Sanitize** — `sqlglot` parses the query; only a single read-only `SELECT` is allowed through.
+5. **Execute** — Athena runs the query over S3 within configured scan and time limits.
+6. **Self-heal** — If a query fails, the error trace is returned to the model for up to three corrective attempts.
+7. **Explain** — The app returns the result table (CSV/Excel export), an interactive chart and, for cost questions, a FinOps narrative.
+
 ---
 
 ## Key System Features
 
-### 1. Autonomous Cloud FinOps & Cost Remediation Engine
+### 1. Cloud FinOps Copilot & Cost Optimization Recommendations
 - **AWS CUR Ingestion & Schema Alignment:** Native understanding of AWS Cost and Usage Reports (CUR), dynamically mapping unblended/effective costs, usage types, operations, and pricing models (`On-Demand`, `Savings Plans`, `Spot`, `Reserved Instances`).
-- **3-Tier Executive FinOps Diagnostics:** Every cost and infrastructure inquiry automatically synthesizes:
-  1. 📊 **Spend & Trend Analysis:** Concrete dollar totals, MoM variances, and percentage spikes.
-  2. 🔍 **Root Cause Diagnosis:** Technical drivers behind anomalies (e.g., month-start recurring commitment fees, tax clumping, unamortized RIs, oversized dev/test compute, or month-end batch pipelines).
-  3. 💡 **Prescriptive Cost Optimization:** Actionable AWS architectural and procurement fixes:
-     - **Immediate Waste Elimination:** Automated non-prod scheduling via AWS Instance Scheduler, deletion of unattached EBS volumes, and obsolete snapshot cleanup.
-     - **Commitment Tuning:** Compute and EC2 Instance Savings Plans coverage optimization.
-     - **Modernization & Rightsizing:** Workload migration to AWS Graviton processors, GP2 to GP3 EBS transitions, and rightsizing idle nodes.
-     - **Governance:** Enforcing AWS Cost Anomaly Detection with SNS alerting and tag-or-terminate policies.
+- **3-Tier Executive FinOps Diagnostics:** Cost and infrastructure inquiries are answered in three tiers:
+  1. 📊 **Spend & Trend Analysis:** Concrete dollar totals, MoM variances, daily trends, service-level spend, and percentage spikes.
+  2. 🔍 **Root Cause Diagnosis (Hypotheses):** Candidate technical drivers inferred from aggregated data (e.g., month-start recurring commitment fees, tax grouping, unamortized RIs/commitments, oversized dev/test compute, or month-end batch pipelines). These are plausible hypotheses to investigate, **not verified findings**.
+  3. 💡 **Prescriptive Cost Optimization:** Suggested AWS architectural and procurement actions:
+     - **Immediate Waste Elimination:** Reviewing idle or unattached resources (e.g., EBS volumes), scheduling non-production workloads (e.g., AWS Instance Scheduler), and cleaning up obsolete snapshots where appropriate.
+     - **Commitment & Pricing:** Reviewing Compute and EC2 Instance Savings Plans coverage; assessing Spot for fault-tolerant workloads.
+     - **Modernization & Rightsizing:** Using AWS Compute Optimizer as an input to rightsizing, evaluating AWS Graviton processors, and reviewing GP2-to-GP3 EBS opportunities.
+     - **Governance:** Improving ownership and environment tagging; considering AWS Cost Anomaly Detection alerts (e.g., via SNS) and tag-or-terminate policies with suitable controls.
+- **Recommendation Boundary:** Treat every recommendation as an investigation or optimization *opportunity* until a drill-down query, resource review, or engineering validation confirms it.
 
 ### 2. Business Semantic Metric Layer (`metrics.yaml`)
-- Eliminates the primary failure mode of enterprise Text-to-SQL: business definition ambiguity.
+- Targets a primary failure mode of Text-to-SQL: business definition ambiguity.
 - Declaratively maps business formulas (e.g., `net_revenue = SUM(order_value - discount_amount)`), entity synonyms (e.g., `"Prime members"` -> `is_prime = true`), and default filter predicates (e.g., `order_status = 'delivered'`).
-- Injects ground truth formulas directly into Bedrock Nova Pro reasoning prompts, eliminating ad-hoc metric hallucinations.
+- Injects ground-truth formulas directly into Bedrock Nova Pro reasoning prompts, reducing ad-hoc metric hallucinations.
 
 ### 3. Serverless Lakehouse Architecture (Amazon S3 + Amazon Athena)
 - Replaces container-bound transactional databases with an analytical data lake (`s3://query-agent-lake-<account_id>/`).
@@ -88,35 +170,41 @@ The platform decouples streaming data ingestion, semantic vector retrieval, AST 
 - **Ad-Hoc UI Streaming (In-Band):** Streamlit file uploader supports batch uploading up to 10+ heterogeneous datasets (CSV, TSV, XLSX, XLS, PARQUET up to 1 GB per file) utilizing memory-buffered streaming to prevent container Out-Of-Memory (OOM) crashes on 2 GB Fargate tasks.
 - **Lakehouse Scale Ingestion (Out-Of-Band):** For multi-gigabyte or terabyte workloads exceeding container ephemeral storage (default 20 GB), files bypass the web server via S3 Multipart Uploads or AWS CLI direct-to-S3 ingestion, followed by immediate AWS Glue Catalog schema synchronization.
 
-### 5. AST Query Sanitization & Zero-Trust Safety (`database.py`)
+### 5. AST Query Sanitization & Read-Only Safety (`database.py`)
 - Employs Abstract Syntax Tree (AST) analysis via `sqlglot` to parse generated SQL before transmission to Athena.
-- **Strict Read-Only Enforcement:** Traverses the expression tree to verify root nodes are `Select` statements. Rejects destructive operations (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `TRUNCATE`, `GRANT`).
-- Neutralizes SQL injection and model hallucination vectors by blocking multi-statement execution and comments that bypass parser validation.
+- **Strict Read-Only Enforcement:** Allows only a single read-only `SELECT` through; traverses the expression tree to verify root nodes are `Select` statements. Rejects destructive operations (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `TRUNCATE`, `GRANT`) and multi-statement SQL.
+- Mitigates SQL injection and model hallucination risks by blocking multi-statement execution and comments that bypass parser validation.
+- **Benchmark result:** all destructive attempts in the 50-prompt test set were blocked.
 
 ### 6. Cross-Table Relational Join Intelligence
 - Bedrock Nova Pro inspects all active tables in the AWS Glue Data Catalog (`query_agent_db`) simultaneously.
 - Infers implicit foreign-key relationships across disparate operational domains (e.g., joining customer demographic attributes from `zomato_customers` with transaction volume in `zomato_orders`).
-- Employs explicit Presto/Trino SQL join semantics (`LEFT JOIN`, `INNER JOIN`) to eliminate `COLUMN_NOT_FOUND` runtime exceptions.
+- Employs explicit Presto/Trino SQL join semantics (`LEFT JOIN`, `INNER JOIN`) to reduce `COLUMN_NOT_FOUND` runtime exceptions.
 
 ### 7. Autonomous Self-Healing Execution Loop
 - Intercepts execution failures, schema mismatches, empty-table zero-row traps, and Trino dialect errors in real time.
 - Feeds raw database exceptions and execution traces back into Nova Pro for up to 3 automated correction iterations before returning output.
+- **Benchmark result:** self-healing recovered 3 of the 4 first-pass failures, lifting overall success from 92.0% to 98.0%.
 
 ### 8. Partition & Storage Layout Advisor (`index_advisor.py`)
 - Analyzes recurring query `WHERE` filters, `JOIN` predicates, and aggregations to output recommendations for:
   - **Partition Keys:** Identifying high-cardinality pruning candidates (e.g., `order_date`, `city`, `season`).
-  - **Columnar Formats:** Advising conversion from raw CSV/JSON to Apache Parquet with Snappy compression to reduce scanned byte volume by 80–90%.
+  - **Columnar Formats:** Advising conversion from raw CSV/JSON to Apache Parquet with Snappy compression to reduce scanned byte volume (an estimated 80–90% for suitable workloads; not measured in the 50-prompt benchmark).
   - **Bucketing Strategies:** Recommending hash-bucketing keys for frequently joined foreign keys.
 
 ### 9. Isolated Multi-Tab Chat History
 - Session management powered by URL query parameters (`?session=<session_id>`) and a shared application resource cache.
 - Opening historical queries renders selected conversations in a new, independent browser tab without disrupting the active query session.
+- Sidebar controls include **Inspect Athena / Glue Schema** and **New Chat / Reset**.
+
+### 10. Transparent, Reviewable Results
+- Each answer is accompanied by the generated SQL, a result table with one-click **CSV / Excel export**, and an interactive **Plotly** chart, so users and reviewers can see how an answer was produced.
 
 ---
 
 ## Security, Guardrails & Governance
 
-### 1. Hardened Least-Privilege IAM Task Role
+### 1. Scoped, Least-Privilege IAM Task Role
 The ECS Fargate task executes under a scoped IAM Task Role. Broad managed policies (`*FullAccess`) are explicitly avoided.
 ```json
 {
@@ -183,40 +271,77 @@ The ECS Fargate task executes under a scoped IAM Task Role. Broad managed polici
 - **Workgroup Per-Query Limit:** Configured with a `BytesScannedCutoffPerQuery` limit (e.g., 1 GB in development) to terminate runaway or unpartitioned full-bucket scans before execution.
 - **Query Timeout Enforcement:** Athena queries automatically cancel after 60 seconds to mitigate resource exhaustion from non-converging joins.
 
----
-
-## Evaluation Benchmark & Golden Queries
-
-### Analytical Benchmark (50 Multi-Table Prompts)
-The agent was evaluated across 50 production test prompts spanning FinOps cloud costs, retail, music streaming, and food delivery domains:
-
-| Metric | Result |
-| :--- | :--- |
-| **First-Pass SQL Generation Accuracy** | 92.0% |
-| **Post-Self-Healing Recovery Rate** | 98.0% |
-| **Average Bedrock End-to-End Latency** | 1.42s |
-| **Average Bedrock Token Cost per Query** | $0.0012 |
-| **AST Mutation Interception Rate** | 100% (Blocks DROP/DELETE/INSERT) |
+### 3. Scope of These Controls
+These controls reduce risk; they do not remove the need for production identity management, data permissions, audit logging and security review. The documented security model covers the application task role. Multi-user authentication (SSO), per-user and row-level data permissions, audit logs and stronger tenant isolation are on the [roadmap](#roadmap).
 
 ---
 
-## 💰 FinOps & Cloud Cost Optimization Benchmarks
+## Evaluation Benchmark
 
-The agent natively parses complex AWS billing datasets (such as `synthetic_cur_aug_sep_2026`) and generates both quantitative analytics and qualitative FinOps playbooks:
+### 50-Prompt Benchmark
+The agent was evaluated on a 50-prompt benchmark spanning FinOps cloud costs, retail, music streaming, and food delivery datasets:
+
+| Metric | Result | Notes |
+| :--- | :--- | :--- |
+| **First-Pass SQL Generation Accuracy** | 92.0% (46/50) | Correct on the first attempt. |
+| **Post-Self-Healing Success Rate** | 98.0% (49/50) | 3 of the 4 first-pass failures were recovered. |
+| **Average Bedrock End-to-End Latency** | 1.42 s | Average end-to-end model latency. |
+| **Average Bedrock Token Cost per Query** | $0.0012 | About $1.20 per 1,000 questions, excluding other infrastructure costs. |
+| **AST Mutation Interception Rate** | 100% | All destructive attempts in the test set (e.g., `DROP`/`DELETE`/`INSERT`) were blocked. |
+
+> **How to read these numbers:** they come from the project's 50-prompt benchmark on synthetic datasets. They are evidence of feasibility, **not** a guarantee of production performance or an enterprise accuracy study. Production CUR data can include credits, refunds, taxes and more complex amortization patterns, so the benchmark should be expanded with reviewed real-world test cases and per-domain accuracy reporting (see the [roadmap](#roadmap)).
+
+---
+
+## 💰 FinOps Demonstration Queries (Synthetic CUR)
+
+The agent parses AWS billing datasets (such as `synthetic_cur_aug_sep_2026`) and returns both quantitative analytics and FinOps guidance. These are demonstration results on a synthetic CUR, not production customer savings.
 
 | FinOps Domain | Natural Language Query | Generated Output & Visualizations |
 | :--- | :--- | :--- |
-| **Statistical Outlier Detection** | `Find the top anomalies and provide me recommendations to resolve it` | 3-sigma anomaly breakdown across AWS services, bar chart of abnormal spend, and immediate waste elimination steps. |
-| **Daily Trend & Spikes** | `From synthetic_cur_aug_sep_2026, show total daily spend for every day in September 2026 ordered by date. Which days have the highest spikes and what are the FinOps recommendations?` | 30-day interactive Plotly line chart highlighting Sep 1 and Sep 30 anomalies, followed by root-cause tax & fee amortization guidance. |
+| **Statistical Outlier Detection** | `Find the top anomalies and provide me recommendations to resolve it` | 3-sigma anomaly breakdown across AWS services, bar chart of abnormal spend, candidate causes, and immediate waste elimination steps. |
+| **Daily Trend & Spikes** | `From synthetic_cur_aug_sep_2026, show total daily spend for every day in September 2026 ordered by date. Which days have the highest spikes and what are the FinOps recommendations?` | 30-day interactive Plotly line chart highlighting Sep 1 and Sep 30 anomalies, followed by candidate-cause guidance on tax & fee amortization. |
 | **Non-Prod Waste Audit** | `From synthetic_cur_aug_sep_2026, show total spend by product_product_name for the dev and test-qa accounts ordered by total spend descending. Provide rightsizing and scheduling recommendations.` | Categorical cost breakdown across dev/QA environments with scheduled shutdown and Spot instance adoption playbooks. |
-| **Tag Hygiene Governance** | `From synthetic_cur_aug_sep_2026, show total spend grouped by line_item_product_code where resource_tags_user_owner is null ordered by total spend descending.` | Unallocated infrastructure cost audit paired with automated tag-or-terminate policy governance. |
+| **Tag Hygiene Governance** | `From synthetic_cur_aug_sep_2026, show total spend grouped by line_item_product_code where resource_tags_user_owner is null ordered by total spend descending.` | Unallocated infrastructure cost audit paired with tagging-governance and tag-or-terminate policy recommendations. |
 | **Compute Sizing Audit** | `From synthetic_cur_aug_sep_2026, show the top 5 EC2 instance types by total spend.` | Instance family cost concentration chart with AWS Graviton migration and Savings Plan recommendations. |
+
+---
+
+## Current Scope, Known Limitations & Roadmap
+
+A credible project separates what is implemented from what is proposed.
+
+### Implemented & Demonstrated
+- Natural-language questions translated into Trino SQL, with schema grounding and semantic metric definitions.
+- SQL validation that allows a single read-only `SELECT` statement.
+- Athena execution over S3 data, including CSV, TSV and Parquet support.
+- Self-healing retries for query errors, up to three corrective iterations.
+- Result tables, CSV/Excel export and interactive Plotly charts.
+- A FinOps narrative for cost questions: spend analysis, candidate causes and optimization recommendations.
+
+### Known Limitations
+- The AWS CUR used for evaluation is **synthetic**, not a live production billing feed.
+- Root-cause explanations are **hypotheses** based on aggregated data; the current workflow does not automatically confirm them with follow-up drill-down queries.
+- The anomaly method is statistical and does not yet include seasonality-aware forecasting.
+- The documented security model covers the application task role; production multi-user authentication and row-level data permissions require additional work.
+- The 50-prompt benchmark is indicative and should be expanded.
+
+### Roadmap
+
+| Priority | Enhancement | Expected outcome |
+| :---: | :--- | :--- |
+| 1 | **Agentic drill-down** | When an anomaly is detected, run follow-up queries by line-item type, pricing term, account and resource to test the suspected cause. |
+| 2 | **Quantified savings** | Estimate potential savings where the data and workload context support a defensible calculation. |
+| 3 | **Forecast-aware anomalies** | Add seasonality-aware baselines and integrate with AWS Cost Anomaly Detection. |
+| 4 | **Larger evaluation harness** | Build a reviewed golden dataset, regression tests and per-domain accuracy reporting. |
+| 5 | **Enterprise hardening** | Add SSO, per-user data permissions, audit logs and stronger tenant isolation. |
+| 6 | **Production CUR pipeline** | Ingest production CUR data as Parquet partitioned by billing period. |
 
 ---
 
 ## Sample Showcase Queries
 
-### 1. Single-Table Aggregation (Metric Breakdown)
+### 1. Metric Aggregation with Default Filters
 *"What is the total order value generated from each city?"*
 ```sql
 SELECT c.city, ROUND(SUM(o.order_value), 2) AS total_order_value
@@ -262,7 +387,7 @@ WHERE rank_num = 1;
 The platform supports delimited text files, columnar Parquet tables, and multi-tenant AWS Cost & Usage Reports:
 
 ### AWS Cost & Usage Report Table (CUR)
-*Evaluation Dataset:* [Synthetic CUR Dataset - Aug/Sep 2026](https://drive.google.com/drive/u/0/folders/1VKXuPVwNDiVyaO3pzjG4AGIKEvSi_HZo)
+*Evaluation Dataset (synthetic — not a live production billing feed):* [Synthetic CUR Dataset - Aug/Sep 2026](https://drive.google.com/drive/u/0/folders/1VKXuPVwNDiVyaO3pzjG4AGIKEvSi_HZo)
 ```sql
 CREATE EXTERNAL TABLE query_agent_db.synthetic_cur_aug_sep_2026 (
     bill_payer_account_id bigint,
@@ -356,7 +481,7 @@ query-agent/
 
 ### 1. Clone & Setup Environment
 ```bash
-git clone [https://github.com/kkaustav/query-agent.git](https://github.com/kkaustav/query-agent.git)
+git clone https://github.com/kkaustav/query-agent.git
 cd query-agent
 
 python3 -m venv .venv
@@ -398,8 +523,8 @@ aws ecr get-login-password --region ${REGION} | docker login --username AWS --pa
 
 # Build for linux/amd64 and push
 docker build --platform linux/amd64 -t query-agent:latest .
-docker tag query-agent:latest ${ACCOUNT_ID}.dkr.ecr.${REGION}[.amazonaws.com/query-agent:latest](https://.amazonaws.com/query-agent:latest)
-docker push ${ACCOUNT_ID}.dkr.ecr.${REGION}[.amazonaws.com/query-agent:latest](https://.amazonaws.com/query-agent:latest)
+docker tag query-agent:latest ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/query-agent:latest
+docker push ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/query-agent:latest
 
 # Trigger zero-downtime rolling deployment
 aws ecs update-service --cluster default --service query-agent --force-new-deployment --region ${REGION}
@@ -420,6 +545,15 @@ To eliminate 24/7 AWS Fargate compute charges when not actively presenting demos
   ```bash
   aws ecs update-service --cluster default --service query-agent --desired-count 1 --region us-east-1
   ```
+
+---
+
+## Project Identity
+
+- **Project:** Autonomous Natural Language Database Query Agent & FinOps Copilot
+- **Author:** Kaustubh Kar
+- **Application:** [query-agent.streamlit.app](https://query-agent.streamlit.app/)
+- **Source code:** [github.com/kkaustav/query-agent](https://github.com/kkaustav/query-agent) (MIT License)
 
 ---
 
