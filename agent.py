@@ -1,9 +1,10 @@
-import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import boto3
 import pandas as pd
+import sqlglot
+from sqlglot import exp
 import yaml
 
 from database import (
@@ -31,34 +32,6 @@ except ImportError:
         def get_advice(self, sql: str, df: Optional[pd.DataFrame] = None) -> Optional[str]:
             return None
 
-# Retroactive class monkey-patching for seamless backwards compatibility
-def _safe_examples_compat(self, *args, **kwargs):
-    for name in ["get_examples", "get_similar_examples", "search", "get_similar", "find_similar"]:
-        fn = getattr(self, name, None)
-        if callable(fn) and fn != _safe_examples_compat:
-            try:
-                return fn(*args, **kwargs)
-            except Exception:
-                pass
-    if hasattr(self, "examples") and isinstance(self.examples, list):
-        return self.examples[:3]
-    return []
-
-ExampleStore.get_similar_examples = _safe_examples_compat
-ExampleStore.get_examples = _safe_examples_compat
-
-def _safe_advisor_compat(self, *args, **kwargs):
-    for name in ["get_advice", "advise", "recommend", "analyze"]:
-        fn = getattr(self, name, None)
-        if callable(fn) and fn != _safe_advisor_compat:
-            try:
-                return fn(*args, **kwargs)
-            except Exception:
-                pass
-    return None
-
-IndexAdvisor.get_advice = _safe_advisor_compat
-
 
 def get_semantic_context() -> str:
     """Reads business formulas, metrics, and synonyms from metrics.yaml wrapped in XML tags."""
@@ -79,13 +52,66 @@ Use these metric formulas and filters when answering business inquiries:
 
 
 def clean_sql_output(raw_output: str) -> str:
-    """Extracts raw SQL statements, removing markdown code fences and trailing semicolons."""
-    sql = raw_output.strip()
-    match = re.search(r"```(?:sql|trino|presto)?\s*(.*?)\s*```", sql, re.DOTALL | re.IGNORECASE)
-    if match:
-        sql = match.group(1).strip()
+    """
+    Strictly extracts a single SQL statement from model output.
+    Rejects multiple fenced code blocks or conversational text surrounding a code block
+    with a retryable ValueError rather than silently guessing which block to execute.
+    """
+    if not raw_output or not raw_output.strip():
+        raise ValueError("Model returned an empty SQL response.")
+
+    text = raw_output.strip()
+    fenced_blocks = re.findall(
+        r"```(?:sql|trino|presto|sqlite|postgres|mysql)?\s*(.*?)\s*```",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    if len(fenced_blocks) > 1:
+        raise ValueError(
+            "Ambiguous model output: multiple markdown code blocks were returned. "
+            "Output ONLY a single valid SQL statement."
+        )
+
+    if len(fenced_blocks) == 1:
+        outside_text = re.sub(
+            r"```(?:sql|trino|presto|sqlite|postgres|mysql)?\s*.*?\s*```",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+        if outside_text:
+            raise ValueError(
+                "Model output included conversational prose outside the SQL code block. "
+                "Output ONLY the raw SQL query."
+            )
+        sql = fenced_blocks[0].strip()
+    else:
+        sql = text
+
     sql = re.sub(r";+\s*$", "", sql)
     return sql
+
+
+def _has_suspicious_cur_filter(sql: str, dialect: str = "trino") -> bool:
+    """
+    Inspects the SQL AST to determine whether an empty result was likely caused by
+    filtering 'product_instance_type' with a service name (e.g. 'EC2', 'S3', 'RDS')
+    rather than 'line_item_product_code'. Avoids retrying valid queries that
+    legitimately return 0 rows.
+    """
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect)
+        for col in ast.find_all(exp.Column):
+            if col.name.lower() == "product_instance_type":
+                parent_pred = col.find_ancestor(exp.EQ, exp.Like, exp.ILike, exp.In)
+                if parent_pred:
+                    pred_sql = parent_pred.sql().upper()
+                    if any(svc in pred_sql for svc in ("EC2", "S3", "RDS", "LAMBDA", "ELB", "CLOUDWATCH")):
+                        return True
+    except Exception:
+        pass
+    return False
 
 
 class NLQueryAgent:
@@ -97,11 +123,14 @@ class NLQueryAgent:
         aws_secret_key: Optional[str] = None,
         aws_region: str = "us-east-1",
         model: str = "amazon.nova-pro-v1:0",
-        db_manager: Any = None
+        db_manager: Any = None,
+        sql_dialect: Optional[str] = None,
     ):
         self.aws_region = aws_region
         self.model = model
         self.db_manager = db_manager
+        # Separate SQL generator dialect from local test DB unless explicitly overridden
+        self.sql_dialect = sql_dialect or getattr(db_manager, "dialect", "trino") or "trino"
 
         session_kwargs = {"region_name": aws_region}
         if aws_access_key and aws_secret_key:
@@ -128,27 +157,60 @@ class NLQueryAgent:
                 self.advisor = None
 
     def _get_examples(self, query: str) -> List[Dict[str, str]]:
-        if not hasattr(self, "example_store") or not self.example_store:
-            return []
-        try:
-            return self.example_store.get_similar_examples(query)
-        except Exception:
+        """Retrieves few-shot SQL examples without class-level monkey-patching."""
+        if not self.example_store:
             return []
 
+        for method_name in (
+            "get_similar_examples",
+            "get_examples",
+            "search",
+            "get_similar",
+            "find_similar",
+        ):
+            method = getattr(self.example_store, method_name, None)
+            if callable(method):
+                try:
+                    result = method(query)
+                    if result is not None:
+                        return result
+                except Exception:
+                    continue
+
+        examples_attr = getattr(self.example_store, "examples", None)
+        if isinstance(examples_attr, list):
+            return examples_attr[:3]
+        return []
+
     def _get_index_advice(self, sql: str, df: Optional[pd.DataFrame] = None) -> Optional[str]:
-        if not hasattr(self, "advisor") or not self.advisor:
+        """Retrieves index/partition recommendations without class-level monkey-patching."""
+        if not self.advisor:
             return None
-        try:
-            return self.advisor.get_advice(sql, df)
-        except Exception:
-            return None
+
+        for method_name in ("get_advice", "advise", "recommend", "analyze"):
+            method = getattr(self.advisor, method_name, None)
+            if callable(method):
+                try:
+                    result = method(sql, df)
+                    if result is not None:
+                        return result
+                except TypeError:
+                    try:
+                        result = method(sql)
+                        if result is not None:
+                            return result
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+        return None
 
     def _build_system_prompt(self, schema: str, examples: List[Dict[str, str]]) -> str:
         prompt = (
             "You are an expert enterprise Data Architect and Presto/Trino SQL engineer for Amazon Athena.\n"
-            "Your objective is to translate natural language inquiries into highly optimized, syntactically correct Trino SQL queries.\n\n"
+            "Your objective is to translate natural language inquiries into highly optimized, syntactically correct SQL queries.\n\n"
             "STRICT EXECUTION GUIDELINES:\n"
-            "1. Output ONLY valid Trino/Presto SQL. Do not include conversational commentary or markdown outside the code block.\n"
+            "1. Output ONLY a single valid SQL statement. Do not include conversational commentary or multiple code blocks.\n"
             "2. Read-Only: Only write SELECT queries or WITH common table expressions followed by SELECT. Never generate DDL or DML mutations.\n"
             "3. Do not append semicolons (;) at the end of the query.\n"
             "4. Cross-Table Joins: Inspect foreign keys in the schema carefully. Always qualify columns with explicit table aliases (e.g. c.customer_id).\n"
@@ -184,8 +246,40 @@ class NLQueryAgent:
 
         return prompt
 
+    @staticmethod
+    def _build_conversation_messages(
+        natural_query: str, history: Optional[List[Dict[str, str]]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Builds a strictly alternating user/assistant message sequence for Bedrock Converse,
+        labeling prior SQL turns as historical context.
+        """
+        messages: List[Dict[str, Any]] = []
+        if history:
+            for turn in history[-3:]:
+                q = (turn.get("question") or "").strip()
+                s = (turn.get("sql") or "").strip()
+                if q and s:
+                    messages.append({"role": "user", "content": [{"text": q}]})
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [{"text": f"-- Previous generated SQL:\n{s}"}],
+                        }
+                    )
+
+        messages.append({"role": "user", "content": [{"text": natural_query}]})
+        return messages
+
     def _call_bedrock(self, system_prompt: str, messages: List[Dict[str, Any]]) -> str:
-        """Invokes Bedrock using the Converse API."""
+        """Validates message alternation and invokes Bedrock using the Converse API."""
+        for idx, msg in enumerate(messages):
+            expected_role = "user" if idx % 2 == 0 else "assistant"
+            if msg.get("role") != expected_role:
+                raise ValueError(
+                    f"Invalid Converse message sequence at index {idx}: expected '{expected_role}', got '{msg.get('role')}'."
+                )
+
         try:
             response = self.bedrock.converse(
                 modelId=self.model,
@@ -195,7 +289,7 @@ class NLQueryAgent:
             )
             return response["output"]["message"]["content"][0]["text"]
         except Exception as e:
-            raise RuntimeError(f"Bedrock Converse API call failed: {e}")
+            raise RuntimeError(f"Bedrock Converse API call failed: {e}") from e
 
     def run_query_with_self_healing(
         self,
@@ -203,20 +297,16 @@ class NLQueryAgent:
         history: Optional[List[Dict[str, str]]] = None,
         max_retries: int = 3
     ) -> Tuple[pd.DataFrame, str, List[Dict[str, Any]], List[Dict[str, str]], Optional[str]]:
-        """Synthesizes SQL, enforces AST security/cost guardrails, executes against Athena, and repairs retryable errors."""
+        """
+        Synthesizes SQL, enforces AST security/cost/syntax guardrails, executes against Athena,
+        and repairs retryable SQL errors without retrying AWS infrastructure failures.
+        """
         schema = self.db_manager.get_schema()
         examples = self._get_examples(natural_query)
         system_prompt = self._build_system_prompt(schema, examples)
-        target_dialect = getattr(self.db_manager, "dialect", "trino")
+        execution_dialect = getattr(self.db_manager, "dialect", self.sql_dialect) or "trino"
 
-        messages: List[Dict[str, Any]] = []
-
-        if history:
-            for turn in history[-3:]:
-                messages.append({"role": "user", "content": [{"text": turn["question"]}]})
-                messages.append({"role": "assistant", "content": [{"text": turn["sql"]}]})
-
-        messages.append({"role": "user", "content": [{"text": natural_query}]})
+        messages = self._build_conversation_messages(natural_query, history)
 
         trace: List[Dict[str, Any]] = []
         final_sql = ""
@@ -225,28 +315,30 @@ class NLQueryAgent:
 
         for attempt in range(1, max_retries + 1):
             raw_response = self._call_bedrock(system_prompt, messages)
-            sql = clean_sql_output(raw_response)
-            final_sql = sql
 
             try:
-                # 1. Authoritative AST Validation:
-                #    - Raises PermissionError for non-SELECT / DDL / DML / multi-statement (non-retryable)
-                #    - Raises ValueError / QueryCostExceededError for SELECT * or syntax errors (retryable)
-                validate_sql_query(sql, dialect=target_dialect)
+                sql = clean_sql_output(raw_response)
+                final_sql = sql
 
-                # 2. Database / Athena Execution (also enforces validate_sql_query internally)
+                # 1. Validate SQL AST (Security -> PermissionError, Wildcard -> QueryCostExceededError, Syntax -> ValueError)
+                validate_sql_query(sql, dialect=execution_dialect)
+
+                # 2. Execute against target backend
                 exec_result = self.db_manager.execute_query(sql)
                 df = exec_result[0] if isinstance(exec_result, tuple) else exec_result
 
-                # 3. Zero-Result Self-Healing Guardrail
-                if (df is None or df.empty) and attempt < max_retries:
+                # 3. Only retry an empty result if the AST exhibits a known CUR column filter error
+                if (df is None or df.empty) and attempt < max_retries and _has_suspicious_cur_filter(sql, dialect=execution_dialect):
                     refinement_hint = (
-                        "The executed query returned 0 rows. Please verify your WHERE clause filters against the database schema:\n"
-                        "- If filtering for AWS services (EC2, S3, RDS, etc.), use line_item_product_code IN ('AmazonEC2', 'AmazonS3') or product_product_name, NEVER product_instance_type.\n"
-                        "- Ensure column values and string patterns match standard Athena conventions.\n"
-                        "Provide a corrected Presto/Trino SQL query that accurately filters and returns data."
+                        "The executed query returned 0 rows because 'product_instance_type' was filtered with an AWS service name. "
+                        "Use line_item_product_code (e.g. 'AmazonEC2', 'AmazonS3') or product_product_name instead, "
+                        "and return a single corrected SQL query."
                     )
-                    trace.append({"attempt": attempt, "status": "empty_retry", "error": "Query returned 0 rows. Retrying with corrected schema filters."})
+                    trace.append({
+                        "attempt": attempt,
+                        "status": "empty_filter_retry",
+                        "error": "Suspicious service filter on product_instance_type returned 0 rows."
+                    })
                     messages.append({"role": "assistant", "content": [{"text": sql}]})
                     messages.append({"role": "user", "content": [{"text": refinement_hint}]})
                     continue
@@ -255,26 +347,52 @@ class NLQueryAgent:
                 break
 
             except PermissionError as sec_err:
-                # Hard security stop: never retry destructive or multi-statement SQL
-                trace.append({"attempt": attempt, "status": "security_blocked", "error": str(sec_err)})
+                trace.append({
+                    "attempt": attempt,
+                    "status": "security_blocked",
+                    "error": str(sec_err)
+                })
                 raise
+
+            except QueryCostExceededError as cost_err:
+                last_error = str(cost_err)
+                trace.append({
+                    "attempt": attempt,
+                    "status": "cost_guardrail_retry",
+                    "error": last_error
+                })
+
+            except ValueError as validation_err:
+                last_error = str(validation_err)
+                trace.append({
+                    "attempt": attempt,
+                    "status": "sql_validation_retry",
+                    "error": last_error
+                })
 
             except Exception as e:
                 last_error = str(e)
-                status_label = "cost_guardrail_retry" if isinstance(e, ValueError) else "error"
-                trace.append({"attempt": attempt, "status": status_label, "error": last_error})
+                trace.append({
+                    "attempt": attempt,
+                    "status": "execution_error",
+                    "error": last_error
+                })
+                raise
 
-                if attempt == max_retries:
-                    raise RuntimeError(f"Execution failed after {max_retries} attempts. Last error: {last_error}") from e
-
-                messages.append({"role": "assistant", "content": [{"text": sql}]})
-                correction_prompt = (
-                    f"Attempt {attempt} failed with the following error:\n{last_error}\n\n"
-                    "Analyze the error trace, inspect the column names and schemas carefully, "
-                    "explicitly project only the required columns (never use SELECT * in any query, CTE, or subquery), "
-                    "and provide a corrected Presto/Trino SQL query with no conversational markdown."
+            # Common retry logic reached ONLY for QueryCostExceededError and ValueError
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"SQL generation failed after {max_retries} attempts. Last validation/cost error: {last_error}"
                 )
-                messages.append({"role": "user", "content": [{"text": correction_prompt}]})
+
+            assistant_turn_text = final_sql if final_sql else raw_response.strip()
+            messages.append({"role": "assistant", "content": [{"text": assistant_turn_text}]})
+            correction_prompt = (
+                f"Attempt {attempt} failed validation with the following error:\n{last_error}\n\n"
+                "Inspect the schema and error message carefully, explicitly project only required columns "
+                "(never use SELECT * in any query, CTE, or subquery), and return ONLY a single corrected SQL query."
+            )
+            messages.append({"role": "user", "content": [{"text": correction_prompt}]})
 
         index_rec = self._get_index_advice(final_sql, df)
         return df, final_sql, trace, examples, index_rec
