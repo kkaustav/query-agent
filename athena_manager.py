@@ -95,6 +95,7 @@ MAX_EXCEL_COLS = 200
 
 ACTIVE_INGESTION_STATES: Set[str] = {"UPLOADING", "VALIDATING", "CUTOVER", "ACTIVE"}
 TERMINAL_INGESTION_STATES: Set[str] = {"RETIRED", "FAILED"}
+STAGING_VALIDATION_ROW_LIMIT = 1000
 
 
 def _validate_athena_decimal_type(type_str: str) -> bool:
@@ -154,8 +155,7 @@ class AthenaManager:
         lease_heartbeat_interval_sec: Optional[float] = None,
         state_retention_seconds: int = 7 * 86400,
         task_owner_id: Optional[str] = None,
-        use_atomic_glue_cutover: bool = False,
-        validate_full_dataset: bool = True,  # Default to full validation for financial integrity
+        validate_full_dataset: bool = True,
     ):
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", database):
             raise ValueError(f"Invalid Glue database identifier: {database}")
@@ -188,7 +188,6 @@ class AthenaManager:
         self.state_retention_seconds = state_retention_seconds
         task_identity = task_owner_id or os.getenv("ECS_TASK_ID") or socket.gethostname()
         self.task_owner_id = f"{task_identity}:{os.getpid()}:{uuid.uuid4().hex}"
-        self.use_atomic_glue_cutover = use_atomic_glue_cutover
         self.validate_full_dataset = validate_full_dataset
         self.output_location = f"s3://{bucket_name}/athena-results/"
         self.workgroup_guardrail_verified = False
@@ -219,10 +218,6 @@ class AthenaManager:
             return cls._TABLE_LOCKS[table_key]
 
     def _next_fencing_token(self) -> int:
-        """
-        Generates a truly globally monotonic fencing token using a DynamoDB atomic counter.
-        Fails closed if the durable sequence generator is unavailable.
-        """
         if self.dynamodb is None or not self.lock_table_name:
             raise AthenaExecutionError("DynamoDB unavailable for atomic fencing token generation.")
         try:
@@ -285,7 +280,7 @@ class AthenaManager:
                     f"Concurrent distributed ingestion conflict for '{lock_key}'."
                 ) from e
             raise AthenaExecutionError(
-                f"Fail-Closed Distributed Lock Error: Cannot acquire required DynamoDB lock for '{lock_key}' ({code}): {e}"
+                f"Fail-Closed Distributed Lock Error: Cannot acquire required DynamoDB lock for '{lock_key}' ({err_code}): {e}"
             ) from e
 
     def _renew_distributed_table_lock(
@@ -332,7 +327,7 @@ class AthenaManager:
                     "Aborting operation to prevent split-brain cutover."
                 ) from e
             raise AthenaExecutionError(
-                f"Fail-Closed Distributed Lock Error: Failed to renew DynamoDB lease for '{lock_key}': {e}"
+                f"Fail-Closed Distributed Lock Error: Failed to renew DynamoDB lease for '{lock_key}' ({err_code}): {e}"
             ) from e
 
     def _release_distributed_table_lock(
@@ -421,42 +416,6 @@ class AthenaManager:
             state=phase_label,
             fencing_token=fencing_token,
         )
-
-    def _get_active_dynamodb_lock_info(self, table_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Fail-closed strong consistent read of the DynamoDB lock to definitively
-        verify ownership status before S3 deletion races.
-        """
-        if self.dynamodb is None or not self.lock_table_name:
-            raise AthenaExecutionError("Fail-Closed Cleanup Error: DynamoDB client unavailable.")
-
-        lock_key = f"{self.database}.{table_name}"
-        try:
-            resp = self.dynamodb.get_item(
-                TableName=self.lock_table_name,
-                Key={"lock_key": {"S": lock_key}},
-                ConsistentRead=True,
-            )
-        except ClientError as e:
-            raise AthenaExecutionError(
-                f"Fail-Closed Cleanup Error: Failed to read DynamoDB lock table for '{lock_key}': {e}"
-            ) from e
-
-        item = resp.get("Item")
-        if not item:
-            return None
-
-        try:
-            return {
-                "lock_key": item["lock_key"]["S"],
-                "owner_id": item["owner_id"]["S"],
-                "ingestion_id": item["ingestion_id"]["S"],
-                "state": item["state"]["S"],
-                "lease_expires_at": float(item["lease_expires_at"]["N"]),
-                "updated_at": float(item["updated_at"]["N"]),
-            }
-        except KeyError as e:
-            raise AthenaExecutionError(f"Fail-Closed Cleanup Error: Malformed DynamoDB lock record: missing {e}")
 
     def _set_ingestion_state(
         self,
@@ -568,43 +527,6 @@ class AthenaManager:
             if s3_prefix in durable:
                 return dict(durable[s3_prefix])
         return None
-
-    def prune_stale_ingestion_records(
-        self, table_name: str, retention_seconds: Optional[int] = None
-    ) -> List[str]:
-        max_age = retention_seconds if retention_seconds is not None else self.state_retention_seconds
-        now_ts = time.time()
-        snapshot = self._get_existing_table_snapshot(table_name)
-        active_prefix = snapshot.get("s3_prefix") if snapshot else None
-
-        durable_states = self._load_durable_ingestion_states(table_name)
-        pruned_prefixes: List[str] = []
-
-        for prefix, rec in list(durable_states.items()):
-            state = rec.get("state", "")
-            updated_at = float(rec.get("updated_at", now_ts))
-            age = now_ts - updated_at
-            is_terminal_or_superseded = (
-                state in TERMINAL_INGESTION_STATES
-                or (state == "ACTIVE" and prefix != active_prefix)
-            )
-            if is_terminal_or_superseded and age >= max_age:
-                ing_id = rec.get("ingestion_id", "")
-                if ing_id:
-                    manifest_key = self._state_manifest_s3_key(table_name, ing_id)
-                    try:
-                        self.s3.delete_objects(
-                            Bucket=self.bucket_name,
-                            Delete={"Objects": [{"Key": manifest_key}], "Quiet": False},
-                        )
-                    except Exception as e:
-                        logger.warning(f"Could not delete expired state manifest '{manifest_key}': {e}")
-
-                with self._REGISTRY_LOCK:
-                    self._INGESTION_STATES.pop(prefix, None)
-                pruned_prefixes.append(prefix)
-
-        return pruned_prefixes
 
     def _verify_workgroup_guardrails(self, strict: bool = True) -> bool:
         try:
@@ -812,6 +734,7 @@ class AthenaManager:
         Fail-Closed Multi-Column Staging Validation:
         Strictly raises an error if S3 location is missing, fetch fails, dataset is empty,
         or any numeric/null checks indicate corrupt data.
+        Mandatory CUR columns (CUR_COLUMN_TYPE_OVERRIDES) enforce a strict 0-null policy.
         """
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", staging_table_name):
             raise ValueError(f"Invalid staging table identifier: {staging_table_name}")
@@ -834,7 +757,6 @@ class AthenaManager:
                 raise ValueError(f"Invalid column identifier in staging validation: {name}")
             names.append(name)
             
-            # Require all fields to not be completely null
             null_alias = f"_null_chk_{idx}"
             checks.append(f"SUM(CASE WHEN {name} IS NULL THEN 1 ELSE 0 END) AS {null_alias}")
             null_col_indices.append((idx, name))
@@ -886,36 +808,46 @@ class AthenaManager:
             ) from e
 
         if val_df.empty or "_sampled_rows" not in val_df.columns:
-            raise ValueError(f"Staging table '{staging_table_name}' returned empty or malformed validation metrics.")
+            raise AthenaExecutionError(f"Staging table '{staging_table_name}' returned empty or malformed validation metrics.")
 
         sampled_rows = int(val_df["_sampled_rows"].iloc[0])
         if sampled_rows <= 0:
-            raise ValueError(f"Staging table '{staging_table_name}' contains 0 readable rows.")
+            raise AthenaExecutionError(f"Staging table '{staging_table_name}' contains 0 readable rows.")
 
         for idx, col_name in numeric_col_indices:
             nan_col = f"_nan_inf_chk_{idx}"
             sum_col = f"_num_chk_{idx}"
 
             if nan_col not in val_df.columns or sum_col not in val_df.columns:
-                raise ValueError(f"Missing expected metric checks for column '{col_name}'.")
+                raise AthenaExecutionError(f"Missing expected metric checks for column '{col_name}'.")
 
             if pd.notna(val_df[nan_col].iloc[0]) and int(float(val_df[nan_col].iloc[0])) > 0:
-                raise ValueError(f"Numeric column '{col_name}' contains NaN or Infinite values.")
+                raise AthenaExecutionError(f"Numeric column '{col_name}' contains NaN or Infinite values.")
 
             raw_sum = val_df[sum_col].iloc[0]
             if pd.notna(raw_sum):
                 float_sum = float(raw_sum)
                 if math.isnan(float_sum) or math.isinf(float_sum):
-                    raise ValueError(
+                    raise AthenaExecutionError(
                         f"Numeric aggregate on column '{col_name}' evaluated to NaN or Infinity ({raw_sum})."
                     )
 
         for idx, col_name in null_col_indices:
             null_col = f"_null_chk_{idx}"
-            if null_col in val_df.columns and pd.notna(val_df[null_col].iloc[0]):
-                null_count = int(float(val_df[null_col].iloc[0]))
+            if null_col not in val_df.columns:
+                raise AthenaExecutionError(f"Missing expected null metric '{null_col}' for column '{col_name}'.")
+                
+            null_count = int(float(val_df[null_col].iloc[0])) if pd.notna(val_df[null_col].iloc[0]) else 0
+
+            # Mandate 0 nulls for standard AWS CUR FinOps columns
+            if col_name in CUR_COLUMN_TYPE_OVERRIDES:
+                if null_count > 0:
+                    raise AthenaExecutionError(
+                        f"Validation Failed: Mandatory FinOps column '{col_name}' contains {null_count} null values."
+                    )
+            else:
                 if null_count == sampled_rows:
-                    raise ValueError(f"Column '{col_name}' is 100% null in the staged dataset.")
+                    raise AthenaExecutionError(f"Validation Failed: Column '{col_name}' is 100% null in the staged dataset.")
 
     def _atomic_glue_update_table(
         self,
@@ -926,6 +858,12 @@ class AthenaManager:
         field_delimiter: str = ",",
         existing_snapshot: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """
+        Zero-downtime, fenced metadata cutover:
+        Atomically updates the existing Glue table's Location and Columns while preserving
+        PartitionKeys, custom Parameters, and Description. Passes VersionId to natively
+        fence against concurrent or stale-worker modifications at the AWS Glue layer.
+        """
         try:
             if existing_snapshot and isinstance(existing_snapshot.get("raw_table_definition"), dict):
                 current = copy.deepcopy(existing_snapshot["raw_table_definition"])
@@ -960,8 +898,24 @@ class AthenaManager:
                 serde["Parameters"] = params
                 sd["SerdeInfo"] = serde
             table_input["StorageDescriptor"] = sd
-            self.glue.update_table(DatabaseName=self.database, TableInput=table_input)
-        except Exception as e:
+            
+            update_kwargs = {
+                "DatabaseName": self.database,
+                "TableInput": table_input,
+            }
+            # Provide VersionId for atomic Compare-and-Swap fencing if available
+            if existing_snapshot and existing_snapshot.get("version_id"):
+                update_kwargs["VersionId"] = str(existing_snapshot["version_id"])
+                
+            self.glue.update_table(**update_kwargs)
+            
+        except ClientError as e:
+            err_code = e.response.get("Error", {}).get("Code", "")
+            if err_code in ("ConcurrentModificationException", "EntityNotFoundException"):
+                raise AthenaExecutionError(
+                    f"Split-Brain Fencing Guardrail: Glue update rejected due to concurrent modification "
+                    f"or version mismatch for '{self.database}.{table_name}'. {e}"
+                ) from e
             raise AthenaExecutionError(
                 f"Atomic Glue UpdateTable failed for '{self.database}.{table_name}': {e}"
             ) from e
@@ -1122,11 +1076,17 @@ class AthenaManager:
         return f"Athena Ingestion DDL ({operation.upper()}) Executed: {query_execution_id}"
 
     def _get_existing_table_snapshot(self, table_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Captures the current Glue table metadata prior to replacement.
+        Returns None ONLY when Glue returns EntityNotFoundException.
+        Re-raises AccessDeniedException or any other AWS ClientError as AthenaExecutionError.
+        """
         try:
             resp = self.glue.get_table(DatabaseName=self.database, Name=table_name)
             tbl = resp.get("Table", {})
             sd = tbl.get("StorageDescriptor", {})
             location = sd.get("Location", "")
+            version_id = tbl.get("VersionId")
             expected_root = f"s3://{self.bucket_name}/data/{table_name}/"
             s3_prefix = (
                 location.replace(f"s3://{self.bucket_name}/", "", 1)
@@ -1146,6 +1106,7 @@ class AthenaManager:
 
             return {
                 "table_name": table_name,
+                "version_id": version_id,
                 "s3_location": location,
                 "s3_prefix": s3_prefix,
                 "col_defs": cols,
@@ -1171,6 +1132,11 @@ class AthenaManager:
         expected_col_defs: Optional[List[Tuple[str, str]]] = None,
         expected_partition_keys: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
+        """
+        Fail-closed verification via Glue GetTable that the target table's
+        StorageDescriptor.Location exactly matches expected_s3_location.
+        Used after both forward production cutovers AND rollback restorations.
+        """
         try:
             resp = self.glue.get_table(DatabaseName=self.database, Name=table_name)
         except ClientError as e:
@@ -1187,7 +1153,7 @@ class AthenaManager:
         sd = tbl.get("StorageDescriptor", {}) if isinstance(tbl, dict) else {}
         actual_location = sd.get("Location") if isinstance(sd, dict) else None
 
-        if actual_location != expected_s3_location:
+        if not isinstance(actual_location, str) or actual_location != expected_s3_location:
             raise AthenaExecutionError(
                 f"Cutover verification failed for '{self.database}.{table_name}': "
                 f"Glue table metadata was not replaced (expected {expected_s3_location!r}, "
@@ -1212,6 +1178,10 @@ class AthenaManager:
                 )
 
     def _delete_s3_prefix(self, s3_prefix: str) -> None:
+        """
+        Deletes all objects under a failed or retired S3 ingestion prefix and
+        inspects the S3 DeleteObjects response for partial deletion errors.
+        """
         if not s3_prefix or not s3_prefix.startswith("data/"):
             return
         paginator = self.s3.get_paginator("list_objects_v2")
@@ -1243,85 +1213,94 @@ class AthenaManager:
     ) -> List[str]:
         """
         Fail-closed, lock- and state-aware cleanup of abandoned S3 ingestion prefixes.
-        Queries the DynamoDB lock directly before attempting any deletions to strictly prevent
-        racing with active uploads. Never interprets missing/unverifiable state as abandoned
-        when require_verified_state=True.
+        To completely eliminate Time-of-Check/Time-of-Use (TOCTOU) races, this method
+        acquires an exclusive CLEANUP lease on the table. While this lease is held,
+        no new ingestions can start. It then evaluates S3 state and safely deletes
+        abandoned prefixes before releasing the lease.
         """
-        snapshot = self._get_existing_table_snapshot(table_name)
-        active_prefix = snapshot.get("s3_prefix") if snapshot else None
-        table_root = f"data/{table_name}/"
-        now_ts = time.time()
+        cleanup_id = f"cleanup_{uuid.uuid4().hex[:8]}"
+        try:
+            self._acquire_distributed_table_lock(table_name, cleanup_id)
+        except AthenaExecutionError as e:
+            logger.info(f"Cleanup skipped: table '{table_name}' is currently locked. ({e})")
+            return []
 
-        durable_states = self._load_durable_ingestion_states(table_name, strict=require_verified_state)
+        try:
+            snapshot = self._get_existing_table_snapshot(table_name)
+            active_prefix = snapshot.get("s3_prefix") if snapshot else None
+            table_root = f"data/{table_name}/"
+            now_ts = time.time()
 
-        prefix_latest_modified: Dict[str, Optional[float]] = {}
-        paginator = self.s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=table_root):
-            for obj in page.get("Contents", []):
-                key = obj.get("Key", "")
-                match = re.match(rf"^(data/{re.escape(table_name)}/ingestion_id=([a-f0-9]+)/)", key)
-                if match:
-                    prefix = match.group(1)
-                    last_mod = obj.get("LastModified")
-                    if isinstance(last_mod, datetime):
-                        obj_ts = (
-                            last_mod.replace(tzinfo=timezone.utc).timestamp()
-                            if last_mod.tzinfo is None
-                            else last_mod.timestamp()
+            durable_states = self._load_durable_ingestion_states(table_name, strict=require_verified_state)
+
+            prefix_latest_modified: Dict[str, Optional[float]] = {}
+            paginator = self.s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket_name, Prefix=table_root):
+                for obj in page.get("Contents", []):
+                    key = obj.get("Key", "")
+                    match = re.match(rf"^(data/{re.escape(table_name)}/ingestion_id=([a-f0-9]+)/)", key)
+                    if match:
+                        prefix = match.group(1)
+                        last_mod = obj.get("LastModified")
+                        if isinstance(last_mod, datetime):
+                            obj_ts = (
+                                last_mod.replace(tzinfo=timezone.utc).timestamp()
+                                if last_mod.tzinfo is None
+                                else last_mod.timestamp()
+                            )
+                            prev = prefix_latest_modified.get(prefix)
+                            prefix_latest_modified[prefix] = max(prev, obj_ts) if prev is not None else obj_ts
+                        elif prefix not in prefix_latest_modified:
+                            prefix_latest_modified[prefix] = None
+
+            removed: List[str] = []
+            for prefix in sorted(prefix_latest_modified.keys()):
+                if prefix == active_prefix:
+                    continue
+
+                state_info = durable_states.get(prefix)
+                if not state_info:
+                    if require_verified_state:
+                        logger.info(
+                            f"Skipping cleanup of prefix '{prefix}' because no verified durable state manifest exists."
                         )
-                        prev = prefix_latest_modified.get(prefix)
-                        prefix_latest_modified[prefix] = max(prev, obj_ts) if prev is not None else obj_ts
-                    elif prefix not in prefix_latest_modified:
-                        prefix_latest_modified[prefix] = None
+                        continue
+                    obj_mod_ts = prefix_latest_modified.get(prefix)
+                    if obj_mod_ts is None or (now_ts - obj_mod_ts) < min_age_seconds:
+                        continue
+                else:
+                    state = state_info.get("state", "")
+                    lease_exp = float(state_info.get("lease_expires_at", 0.0))
+                    updated_at = float(state_info.get("updated_at", now_ts))
+                    age_sec = now_ts - updated_at
 
-        removed: List[str] = []
-        for prefix in sorted(prefix_latest_modified.keys()):
-            if prefix == active_prefix:
-                continue
-
-            state_info = durable_states.get(prefix)
-            if not state_info:
-                if require_verified_state:
-                    logger.info(
-                        f"Skipping cleanup of prefix '{prefix}' because no verified durable state manifest exists."
+                    # If an ingestion crashed mid-upload, its state is UPLOADING but its lease has expired.
+                    # We ONLY skip if the state is active AND the lease hasn't expired.
+                    is_terminal_or_crashed = (
+                        state in TERMINAL_INGESTION_STATES
+                        or lease_exp <= now_ts
                     )
-                    continue
-                obj_mod_ts = prefix_latest_modified.get(prefix)
-                if obj_mod_ts is None or (now_ts - obj_mod_ts) < min_age_seconds:
-                    continue
-            else:
-                state = state_info.get("state", "")
-                lease_exp = float(state_info.get("lease_expires_at", 0.0))
-                updated_at = float(state_info.get("updated_at", now_ts))
-                age_sec = now_ts - updated_at
+                    
+                    if not is_terminal_or_crashed and age_sec < min_age_seconds:
+                        logger.info(
+                            f"Skipping cleanup of prefix '{prefix}' (durable state={state}, lease unexpired, owner={state_info.get('owner_id')})."
+                        )
+                        continue
 
-                if state in ACTIVE_INGESTION_STATES and (lease_exp == 0.0 or now_ts < lease_exp or age_sec < min_age_seconds):
-                    logger.info(
-                        f"Skipping cleanup of prefix '{prefix}' (durable state={state}, owner={state_info.get('owner_id')})."
-                    )
-                    continue
+                    if age_sec < min_age_seconds:
+                        logger.info(
+                            f"Skipping cleanup of prefix '{prefix}' (age {age_sec:.1f}s < threshold {min_age_seconds}s)."
+                        )
+                        continue
 
-                if age_sec < min_age_seconds:
-                    logger.info(
-                        f"Skipping cleanup of prefix '{prefix}' (age {age_sec:.1f}s < threshold {min_age_seconds}s)."
-                    )
-                    continue
+                logger.info(f"Cleaning up abandoned S3 staging prefix '{prefix}' for table '{table_name}'.")
+                self._delete_s3_prefix(prefix)
+                removed.append(prefix)
 
-            # FINAL AUTHORITATIVE TOCTOU CHECK: Query DynamoDB lock table immediately before S3 deletion
-            active_lock = self._get_active_dynamodb_lock_info(table_name)
-            if active_lock and float(active_lock.get("lease_expires_at", 0.0)) > time.time():
-                locked_ingestion_id = active_lock.get("ingestion_id")
-                if locked_ingestion_id and f"ingestion_id={locked_ingestion_id}/" in prefix:
-                    logger.info(
-                        f"Skipping cleanup of prefix '{prefix}' (holds active DynamoDB lock for ingestion_id='{locked_ingestion_id}')."
-                    )
-                    continue
+            return removed
 
-            logger.info(f"Cleaning up abandoned S3 staging prefix '{prefix}' for table '{table_name}'.")
-            self._delete_s3_prefix(prefix)
-            removed.append(prefix)
-
-        return removed
+        finally:
+            self._release_distributed_table_lock(table_name, cleanup_id)
 
     def get_schema(self) -> str:
         schema_lines = []
@@ -1776,6 +1755,7 @@ class AthenaManager:
             else:
                 raise ValueError(f"Unsupported file format: {raw_name}")
 
+            # Pre-validate staging CREATE DDL AST before touching S3
             self._build_and_validate_create_ddl(
                 table_name=staging_tbl_name,
                 col_defs=col_defs,
@@ -1784,13 +1764,15 @@ class AthenaManager:
                 field_delimiter=field_delimiter,
                 expected_base_table=tbl_name,
             )
-            self._build_and_validate_create_ddl(
-                table_name=tbl_name,
-                col_defs=col_defs,
-                storage_format=storage_format,
-                s3_location=s3_location,
-                field_delimiter=field_delimiter,
-            )
+            # Only validate production CREATE DDL if we are NOT using the atomic UpdateTable path
+            if previous_snapshot is None or not self.use_atomic_glue_cutover:
+                self._build_and_validate_create_ddl(
+                    table_name=tbl_name,
+                    col_defs=col_defs,
+                    storage_format=storage_format,
+                    s3_location=s3_location,
+                    field_delimiter=field_delimiter,
+                )
 
             # Phase 2: Upload to isolated S3 prefix, register & validate staging table, then cut over
             table_modified_or_dropped = False
@@ -1894,7 +1876,8 @@ class AthenaManager:
                     s3_prefix, tbl_name, ingestion_id, "CUTOVER", fencing_token=fencing_token
                 )
 
-                if previous_snapshot is not None and self.use_atomic_glue_cutover:
+                if previous_snapshot is not None:
+                    # ALWAYS use atomic Glue UpdateTable for existing tables so VersionId natively fences
                     table_modified_or_dropped = True
                     self._atomic_glue_update_table(
                         table_name=tbl_name,
@@ -1905,10 +1888,8 @@ class AthenaManager:
                         existing_snapshot=previous_snapshot,
                     )
                 else:
-                    if previous_snapshot is not None:
-                        self._execute_ingestion_ddl(operation="drop", table_name=tbl_name)
-                        table_modified_or_dropped = True
-
+                    # For first-time ingestion, use CREATE EXTERNAL TABLE IF NOT EXISTS
+                    # If a stale worker runs this concurrently, the IF NOT EXISTS natively prevents overwriting
                     self._execute_ingestion_ddl(
                         operation="create",
                         table_name=tbl_name,
@@ -1918,14 +1899,12 @@ class AthenaManager:
                         field_delimiter=field_delimiter,
                     )
 
-                # Post-cutover checks run unconditionally for BOTH atomic and non-atomic paths
+                # Post-cutover checks run unconditionally
                 self._verify_table_location_updated(
                     table_name=tbl_name,
                     expected_s3_location=s3_location,
                     expected_col_defs=col_defs,
-                    expected_partition_keys=(
-                        expected_partition_keys if self.use_atomic_glue_cutover else None
-                    ),
+                    expected_partition_keys=expected_partition_keys if previous_snapshot else None,
                 )
                 self._set_ingestion_state(
                     s3_prefix, tbl_name, ingestion_id, "ACTIVE", fencing_token=fencing_token
@@ -1965,33 +1944,21 @@ class AthenaManager:
                 ):
                     expected_prev_loc = previous_snapshot["s3_location"]
                     try:
-                        if self.use_atomic_glue_cutover:
-                            self._atomic_glue_update_table(
-                                table_name=tbl_name,
-                                col_defs=previous_snapshot["col_defs"],
-                                storage_format=previous_snapshot["storage_format"],
-                                s3_location=expected_prev_loc,
-                                field_delimiter=previous_snapshot["field_delimiter"],
-                                existing_snapshot=previous_snapshot,
-                            )
-                        else:
-                            self._execute_ingestion_ddl(
-                                operation="create",
-                                table_name=tbl_name,
-                                col_defs=previous_snapshot["col_defs"],
-                                storage_format=previous_snapshot["storage_format"],
-                                s3_location=expected_prev_loc,
-                                field_delimiter=previous_snapshot["field_delimiter"],
-                            )
+                        self._atomic_glue_update_table(
+                            table_name=tbl_name,
+                            col_defs=previous_snapshot["col_defs"],
+                            storage_format=previous_snapshot["storage_format"],
+                            s3_location=expected_prev_loc,
+                            field_delimiter=previous_snapshot["field_delimiter"],
+                            existing_snapshot=previous_snapshot,
+                        )
 
                         # Independent fail-closed verification of restored production location
                         self._verify_table_location_updated(
                             table_name=tbl_name,
                             expected_s3_location=expected_prev_loc,
                             expected_col_defs=previous_snapshot["col_defs"],
-                            expected_partition_keys=(
-                                expected_partition_keys if self.use_atomic_glue_cutover else None
-                            ),
+                            expected_partition_keys=expected_partition_keys,
                         )
 
                     except Exception as restore_err:
