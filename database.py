@@ -13,8 +13,8 @@ from sqlalchemy.exc import OperationalError
 class QueryCostExceededError(ValueError):
     """
     Raised when an AST cost guardrail (such as SELECT *) or EXPLAIN plan
-    exceeds execution safety thresholds. Subclasses ValueError so it is
-    treated as a retryable cost/validation error rather than a PermissionError.
+    exceeds execution safety thresholds. Subclasses ValueError so callers
+    can distinguish retryable cost violations from syntax errors and PermissionErrors.
     """
     pass
 
@@ -62,16 +62,15 @@ def _normalize_dialect(dialect: str) -> str:
 
 def validate_sql_query(sql: str, dialect: str = "trino") -> None:
     """
-    Single authoritative AST security & FinOps cost boundary.
+    Authoritative AST security, syntax, and FinOps cost validator.
 
-    1. Raises PermissionError (non-retryable) if:
-       - The query is empty, contains multiple statements (e.g. 'SELECT 1; DROP TABLE x'),
-         or is not a read-only SELECT / UNION / WITH statement.
-       - Any DDL/DML/administrative node (DROP, DELETE, UPDATE, INSERT, etc.) exists in the AST.
-
-    2. Raises QueryCostExceededError (a subclass of ValueError, retryable) if:
-       - Any SELECT node anywhere in the AST (top-level, CTE, subquery, IN, EXISTS)
-         projects a bare '*' or 'table.*' wildcard (COUNT(*) remains allowed).
+    Exception Contract:
+    - PermissionError (non-retryable): Empty query, multi-statement query,
+      or any DDL/DML/administrative statement (DROP, DELETE, UPDATE, etc.).
+    - QueryCostExceededError (retryable subclass of ValueError): Any SELECT node
+      in the AST (top-level, CTE, or subquery) projects '*' or 'table.*'.
+    - ValueError (retryable): Malformed SQL syntax or empty SELECT projection list
+      (e.g. 'SELECT FROM cur_data').
     """
     if not sql or not sql.strip():
         raise PermissionError("Security Guardrail: Empty SQL query is not permitted.")
@@ -83,7 +82,7 @@ def validate_sql_query(sql: str, dialect: str = "trino") -> None:
     try:
         tokens = sqlglot.tokenize(cleaned, read=target_dialect)
     except Exception as e:
-        raise PermissionError(f"Security Guardrail: Failed to tokenize SQL in '{target_dialect}' dialect: {e}") from e
+        raise ValueError(f"SQL Syntax Error during tokenization in '{target_dialect}' dialect: {e}") from e
 
     # Strip trailing semicolons at the token level
     while tokens and tokens[-1].token_type == TokenType.SEMICOLON:
@@ -96,7 +95,7 @@ def validate_sql_query(sql: str, dialect: str = "trino") -> None:
     if any(tok.token_type == TokenType.SEMICOLON for tok in tokens):
         raise PermissionError("Security Guardrail: Multi-statement SQL execution is prohibited.")
 
-    # Check the first token to immediately classify obvious non-SELECT/WITH commands as PermissionError
+    # Verify leading token is SELECT, WITH, or L_PAREN; classify DDL/DML starts immediately as PermissionError
     first_token_type = tokens[0].token_type
     allowed_leading_tokens = {
         TokenType.SELECT,
@@ -109,6 +108,13 @@ def validate_sql_query(sql: str, dialect: str = "trino") -> None:
             f"(found leading token '{tokens[0].text.upper()}')."
         )
 
+    # Catch 'SELECT FROM ...' missing projection syntax error at token level before AST parse
+    for idx in range(len(tokens) - 1):
+        if tokens[idx].token_type == TokenType.SELECT and tokens[idx + 1].token_type == TokenType.FROM:
+            raise ValueError(
+                "SQL Syntax Error: SELECT clause is missing column projections before FROM."
+            )
+
     # 2. Strict single-dialect AST parse (no fallback parser)
     cleaned_no_trailing_semi = cleaned.rstrip("; \t\r\n")
     try:
@@ -118,7 +124,6 @@ def validate_sql_query(sql: str, dialect: str = "trino") -> None:
             error_level=sqlglot.ErrorLevel.RAISE,
         )
     except sqlglot.errors.ParseError as e:
-        # Leading token was already verified as SELECT/WITH; raise retryable ValueError for syntax repair
         raise ValueError(f"SQL Syntax Error in '{target_dialect}' dialect: {e}") from e
 
     if len(statements) != 1 or statements[0] is None:
@@ -137,12 +142,17 @@ def validate_sql_query(sql: str, dialect: str = "trino") -> None:
             "Security Guardrail: Mutating or administrative SQL construct detected in AST."
         )
 
-    # 4. Recursive FinOps Wildcard Check across ALL SELECT nodes (outer, CTEs, subqueries, EXISTS)
+    # 4. Recursive FinOps Wildcard & Non-Empty Projection Check across ALL SELECT nodes
     select_nodes = list(ast.find_all(exp.Select))
     if not select_nodes:
         raise PermissionError("Security Guardrail: Query does not contain a valid SELECT clause.")
 
     for select_node in select_nodes:
+        if not select_node.expressions:
+            raise ValueError(
+                "SQL Syntax Error: SELECT clause must specify at least one column or expression."
+            )
+
         for projection in select_node.expressions:
             target = projection.this if isinstance(projection, exp.Alias) else projection
             # Blocks SELECT * and SELECT table.* while allowing aggregate COUNT(*)
@@ -158,17 +168,17 @@ def validate_sql_query(sql: str, dialect: str = "trino") -> None:
 
 def is_read_only_query(sql: str, dialect: str = "trino") -> bool:
     """
-    Returns True if the query passes strict AST read-only security validation
-    (ignoring retryable SELECT * cost errors), or False if it raises PermissionError.
+    Returns True only if the query is syntactically valid and read-only
+    (including read-only queries blocked by QueryCostExceededError).
+    Returns False for PermissionError (DDL/DML/multi-statement) and ValueError (invalid syntax).
     """
     try:
         validate_sql_query(sql, dialect=dialect)
         return True
-    except PermissionError:
-        return False
-    except ValueError:
-        # Query is read-only, even if it has a retryable SELECT * or syntax issue
+    except QueryCostExceededError:
         return True
+    except (PermissionError, ValueError):
+        return False
 
 
 def validate_no_select_star(sql: str, dialect: str = "trino") -> Tuple[bool, str]:
@@ -277,8 +287,9 @@ class DatabaseManager:
 
     def validate_query(self, sql: str) -> Tuple[bool, str]:
         """
-        Validates query read-only status and recursive wildcard rules via AST.
-        Raises PermissionError for security violations and ValueError for wildcard/syntax violations.
+        Validates query read-only status, syntax, and recursive wildcard rules via AST.
+        Raises PermissionError for security violations, QueryCostExceededError for wildcards,
+        and ValueError for syntax errors.
         """
         validate_sql_query(sql, dialect=self.dialect)
         return True, ""
@@ -337,7 +348,7 @@ class DatabaseManager:
         """
         Enforces the AST security & cost boundary, inspects EXPLAIN plans,
         and executes the read-only SQL statement against the target database.
-        Raises PermissionError on non-SELECT/destructive SQL and ValueError on SELECT *.
+        Note: Database connections should also use a SELECT-only database user in production.
         """
         validate_sql_query(sql, dialect=self.dialect)
         cleaned_sql = sql.strip().rstrip(";")
@@ -345,9 +356,9 @@ class DatabaseManager:
         plan_info = self.inspect_query_cost(cleaned_sql) if check_cost else {}
 
         try:
-            with self.engine.connect() as connection:
+            with self.engine.begin() as connection:
                 if self.dialect == "postgresql":
-                    connection.execute(text("SET TRANSACTION READ ONLY;"))
+                    connection.execute(text("SET LOCAL TRANSACTION READ ONLY;"))
                 df = pd.read_sql_query(text(cleaned_sql), connection)
                 return df, plan_info
         except OperationalError as e:
