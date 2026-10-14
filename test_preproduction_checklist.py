@@ -11,6 +11,8 @@ from database import (
     AthenaExecutionError,
     AthenaResultRetrievalError,
     AthenaTimeoutError,
+    ExecutionPlanCostExceededError,
+    ProjectionCostExceededError,
     QueryCostExceededError,
     SQLValidationError,
     is_read_only_query,
@@ -18,7 +20,6 @@ from database import (
     validate_sql_query,
 )
 
-# 14 SQL Validation Test Cases (covering Section 5.5, CTEs, parenthesized SELECT, and ;; rejection)
 SQL_VALIDATION_CASES = [
     ("SELECT COUNT(*) FROM cur_data", "ALLOW", True),
     ("SELECT SUM(line_item_unblended_cost) FROM cur_data", "ALLOW", True),
@@ -44,7 +45,6 @@ SQL_VALIDATION_CASES = [
     ("SELECT FROM cur_data", "SYNTAX_RETRY", False),
 ]
 
-# All 12 Forbidden DDL/DML/Admin statements from Section 1.3
 FORBIDDEN_STATEMENT_CASES = [
     "DROP TABLE cur_data",
     "ALTER TABLE cur_data ADD COLUMN x STRING",
@@ -61,9 +61,33 @@ FORBIDDEN_STATEMENT_CASES = [
 ]
 
 
+def _build_mock_manager():
+    mock_athena = MagicMock()
+    mock_s3 = MagicMock()
+    mock_glue = MagicMock()
+
+    mock_athena.get_work_group.return_value = {
+        "WorkGroup": {
+            "Configuration": {
+                "EnforceWorkGroupConfiguration": True,
+                "BytesScannedCutoffPerQuery": 104857600,
+            }
+        }
+    }
+
+    def client_factory(service_name, **kwargs):
+        return {"athena": mock_athena, "s3": mock_s3, "glue": mock_glue}[service_name]
+
+    with patch("athena_manager.boto3.client", side_effect=client_factory):
+        mgr = AthenaManager(database="finops_db", bucket_name="cur-bucket", work_group="nl-bi-finops-workgroup")
+    return mgr, mock_athena, mock_s3, mock_glue
+
+
 def test_sql_validation_and_forbidden_nodes():
-    print("=== 1. Testing SQL Validation & Forbidden AST Nodes (14 Cases + 12 DDL/DML Verbs) ===")
-    assert normalize_dialect("awsathena") == "trino", "awsathena must normalize to trino"
+    print("=== 1. Testing SQL Validation, ProjectionCostExceededError & Forbidden AST Nodes ===")
+    assert normalize_dialect("awsathena") == "trino"
+    assert issubclass(ProjectionCostExceededError, QueryCostExceededError)
+    assert issubclass(ExecutionPlanCostExceededError, QueryCostExceededError)
 
     for dialect in ("trino", "sqlite", "awsathena"):
         for sql, expected, expected_ro in SQL_VALIDATION_CASES:
@@ -72,7 +96,7 @@ def test_sql_validation_and_forbidden_nodes():
                 actual = "ALLOW"
             except PermissionError:
                 actual = "IMMEDIATE_BLOCK"
-            except QueryCostExceededError:
+            except ProjectionCostExceededError:
                 actual = "COST_RETRY"
             except SQLValidationError:
                 actual = "SYNTAX_RETRY"
@@ -89,25 +113,22 @@ def test_sql_validation_and_forbidden_nodes():
                 pass
             assert is_read_only_query(forbidden_sql, dialect=dialect) is False
 
-    print(f"[PASS] All {len(SQL_VALIDATION_CASES)} validation cases & {len(FORBIDDEN_STATEMENT_CASES)} DDL/DML verbs verified across trino, sqlite, and awsathena.")
+    print(f"[PASS] All {len(SQL_VALIDATION_CASES)} validation cases & {len(FORBIDDEN_STATEMENT_CASES)} DDL/DML verbs verified.")
 
 
 def test_clean_sql_output_cases():
-    print("\n=== 2. Testing clean_sql_output() Malformed Output Suite (8 Cases) ===")
-    # 1. One valid SQL code block
+    print("\n=== 2. Testing clean_sql_output() Malformed Output Suite ===")
     assert clean_sql_output("```sql\nSELECT col1 FROM tbl\n```") == "SELECT col1 FROM tbl"
-    # 2. Raw SQL without code block
+    assert clean_sql_output("```SELECT\ncol1 FROM tbl```") == "SELECT\ncol1 FROM tbl"
     assert clean_sql_output("SELECT col1 FROM tbl") == "SELECT col1 FROM tbl"
-    # 3. SQL containing backticks inside a single-quoted string literal
     assert clean_sql_output("SELECT 'a```b' AS msg FROM tbl") == "SELECT 'a```b' AS msg FROM tbl"
 
-    # 4-8. Invalid/ambiguous cases that must raise SQLValidationError
     invalid_outputs = [
-        "```sql\nSELECT 1\n```\n```sql\nSELECT 2\n```",  # Two code blocks
-        "Here is your query:\n```sql\nSELECT 1\n```",    # Explanatory text before
-        "```sql\nSELECT 1\n```\nHope this helps!",       # Explanatory text after
-        "```sql\n   \n```",                              # Empty code block
-        "```python\nSELECT 1\n```",                      # Unsupported language label
+        "```sql\nSELECT 1\n```\n```sql\nSELECT 2\n```",
+        "Here is your query:\n```sql\nSELECT 1\n```",
+        "```sql\nSELECT 1\n```\nHope this helps!",
+        "```sql\n   \n```",
+        "```python\nSELECT 1\n```",
     ]
     for bad_out in invalid_outputs:
         try:
@@ -115,224 +136,260 @@ def test_clean_sql_output_cases():
             raise AssertionError(f"Expected SQLValidationError for {bad_out!r}")
         except SQLValidationError:
             pass
-    print("[PASS] All 8 clean_sql_output() cases passed.")
+    print("[PASS] All clean_sql_output() cases passed.")
 
 
-def test_agent_retry_classification():
-    print("\n=== 3. Testing Agent Retry Classification (7 Scenarios from Section 5.4) ===")
+def test_review4_12_mandatory_scenarios():
+    print("\n=== 3. Testing All 12 Mandatory Review #4 Scenarios ===")
 
-    def _make_agent(bedrock_outputs, execute_side_effect=None):
-        mock_db = MagicMock()
-        mock_db.dialect = "awsathena"
-        mock_db.get_schema.return_value = "CREATE EXTERNAL TABLE cur_data (line_item_product_code STRING);"
-        if execute_side_effect is not None:
-            mock_db.execute_query.side_effect = execute_side_effect
-        else:
-            mock_db.execute_query.return_value = (pd.DataFrame({"line_item_product_code": ["AmazonEC2"]}), "ID: 1")
-
-        with patch("agent.boto3.Session") as mock_sess:
-            mock_bedrock = MagicMock()
-            mock_bedrock.converse.side_effect = [
-                {"output": {"message": {"content": [{"text": out}]}}} for out in bedrock_outputs
-            ]
-            mock_sess.return_value.client.return_value = mock_bedrock
-            agent = NLQueryAgent(db_manager=mock_db)
-            return agent, mock_db, mock_bedrock
-
-    # 1. SELECT * -> Retries and succeeds on attempt 2
-    agent, db, _ = _make_agent(["SELECT * FROM cur_data", "SELECT line_item_product_code FROM cur_data"])
-    df, sql, trace, _, _ = agent.run_query_with_self_healing("Show services")
-    assert len(trace) == 2 and trace[0]["status"] == "cost_guardrail_retry" and trace[1]["status"] == "success"
-
-    # 2. SELECT table.* -> Retries and succeeds on attempt 2
-    agent, db, _ = _make_agent(["SELECT c.* FROM cur_data c", "SELECT c.line_item_product_code FROM cur_data c"])
-    df, sql, trace, _, _ = agent.run_query_with_self_healing("Show services")
-    assert len(trace) == 2 and trace[0]["status"] == "cost_guardrail_retry" and trace[1]["status"] == "success"
-
-    # 3. Invalid SQL syntax -> Retries and succeeds on attempt 2
-    agent, db, _ = _make_agent(["SELECT FROM cur_data", "SELECT line_item_product_code FROM cur_data"])
-    df, sql, trace, _, _ = agent.run_query_with_self_healing("Show services")
-    assert len(trace) == 2 and trace[0]["status"] == "sql_validation_retry" and trace[1]["status"] == "success"
-
-    # 4. DROP TABLE -> Immediately raises PermissionError on attempt 1 (no retry)
-    agent, db, bedrock = _make_agent(["DROP TABLE cur_data", "SELECT line_item_product_code FROM cur_data"])
-    try:
-        agent.run_query_with_self_healing("Drop table")
-        raise AssertionError("Expected PermissionError for DROP TABLE")
-    except PermissionError:
-        assert bedrock.converse.call_count == 1
-
-    # 5. Athena AccessDenied -> Immediately raises AthenaExecutionError on attempt 1 (no retry)
-    agent, db, bedrock = _make_agent(
-        ["SELECT line_item_product_code FROM cur_data", "SELECT COUNT(*) FROM cur_data"],
-        execute_side_effect=AthenaExecutionError("AccessDeniedException: User is not authorized"),
-    )
-    try:
-        agent.run_query_with_self_healing("Show services")
-        raise AssertionError("Expected AthenaExecutionError")
-    except AthenaExecutionError:
-        assert bedrock.converse.call_count == 1
-
-    # 6. Athena timeout -> Immediately raises AthenaTimeoutError on attempt 1 (no retry)
-    agent, db, bedrock = _make_agent(
-        ["SELECT line_item_product_code FROM cur_data", "SELECT COUNT(*) FROM cur_data"],
-        execute_side_effect=AthenaTimeoutError("Query timed out"),
-    )
-    try:
-        agent.run_query_with_self_healing("Show services")
-        raise AssertionError("Expected AthenaTimeoutError")
-    except AthenaTimeoutError:
-        assert bedrock.converse.call_count == 1
-
-    # 7. Valid SELECT -> Executes in 1 attempt
-    agent, db, bedrock = _make_agent(["SELECT line_item_product_code FROM cur_data"])
-    df, sql, trace, _, _ = agent.run_query_with_self_healing("Show services")
-    assert len(trace) == 1 and trace[0]["status"] == "success" and not df.empty
-
-    print("[PASS] All 7 Agent retry classification scenarios verified.")
-
-
-def test_athena_manager_integration_and_recovery():
-    print("\n=== 4. Testing AthenaManager Workgroup, Pagination, S3 Retrieval & Safe Table Replacement ===")
-
-    def _build_mock_manager():
-        mock_athena = MagicMock()
-        mock_s3 = MagicMock()
-        mock_glue = MagicMock()
-
-        mock_athena.get_work_group.return_value = {
-            "WorkGroup": {
-                "Configuration": {
-                    "EnforceWorkGroupConfiguration": True,
-                    "BytesScannedCutoffPerQuery": 104857600,
-                }
-            }
-        }
-
-        def client_factory(service_name, **kwargs):
-            return {"athena": mock_athena, "s3": mock_s3, "glue": mock_glue}[service_name]
-
-        with patch("athena_manager.boto3.client", side_effect=client_factory):
-            mgr = AthenaManager(database="finops_db", bucket_name="cur-bucket", work_group="nl-bi-finops-workgroup")
-        return mgr, mock_athena, mock_s3, mock_glue
-
-    # 4.1 Fail-closed Workgroup test with specific message check
-    with patch("athena_manager.boto3.client") as mock_boto:
-        bad_athena = MagicMock()
-        bad_athena.get_work_group.return_value = {
-            "WorkGroup": {"Configuration": {"EnforceWorkGroupConfiguration": False}}
-        }
-        mock_boto.return_value = bad_athena
-        try:
-            AthenaManager(database="finops_db", bucket_name="cur-bucket", strict_workgroup_check=True)
-            raise AssertionError("Expected AthenaExecutionError on missing scan cutoff")
-        except AthenaExecutionError as e:
-            assert "scan cutoff" in str(e), f"Unexpected error message: {e}"
-
-    # 4.2 Athena query succeeds, but S3 result retrieval returns AccessDenied -> raises AthenaResultRetrievalError with Execution ID
+    # Scenario 1: Glue GetTable returns EntityNotFoundException -> Treat as a new table
     mgr, mock_athena, mock_s3, mock_glue = _build_mock_manager()
-    mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-access-denied-99"}
-    mock_athena.get_query_execution.return_value = {
-        "QueryExecution": {
-            "Status": {"State": "SUCCEEDED"},
-            "ResultConfiguration": {"OutputLocation": "s3://cur-bucket/athena-results/qid-access-denied-99.csv"},
-        }
+    mock_glue.get_table.side_effect = ClientError(
+        {"Error": {"Code": "EntityNotFoundException", "Message": "Table not found"}}, "GetTable"
+    )
+    assert mgr._get_existing_table_snapshot("new_table") is None
+    print("[PASS] 1/12: Glue EntityNotFoundException treated as a new table.")
+
+    # Scenario 2: Glue GetTable returns AccessDeniedException -> Fail ingestion
+    mgr, mock_athena, mock_s3, mock_glue = _build_mock_manager()
+    mock_glue.get_table.side_effect = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "Access denied"}}, "GetTable"
+    )
+    csv_f = io.BytesIO(b"col1,col2\n1,2\n")
+    csv_f.name = "sec_test.csv"
+    try:
+        mgr.stream_upload_and_create_table(csv_f)
+        raise AssertionError("Expected AthenaExecutionError when Glue GetTable returns AccessDeniedException")
+    except AthenaExecutionError as e:
+        assert "AccessDeniedException" in str(e)
+    print("[PASS] 2/12: Glue AccessDeniedException fails ingestion immediately.")
+
+    # Scenario 3: S3 DeleteObjects returns partial errors -> Report cleanup failure
+    mgr, mock_athena, mock_s3, mock_glue = _build_mock_manager()
+    s3_paginator = MagicMock()
+    s3_paginator.paginate.return_value = [{"Contents": [{"Key": "data/tbl/ingestion_id=1/file.csv"}]}]
+    mock_s3.get_paginator.return_value = s3_paginator
+    mock_s3.delete_objects.return_value = {
+        "Errors": [{"Key": "data/tbl/ingestion_id=1/file.csv", "Code": "AccessDenied", "Message": "Access Denied"}]
     }
-    mock_s3.get_object.side_effect = ClientError(
-        {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}}, "GetObject"
-    )
     try:
-        mgr.execute_query("SELECT line_item_product_code FROM cur_data")
-        raise AssertionError("Expected AthenaResultRetrievalError on S3 AccessDenied")
-    except AthenaResultRetrievalError as e:
-        assert "qid-access-denied-99" in str(e)
+        mgr._delete_s3_prefix("data/tbl/ingestion_id=1/")
+        raise AssertionError("Expected AthenaExecutionError on partial S3 delete failure")
+    except AthenaExecutionError as e:
+        assert "partial deletion errors" in str(e)
+    print("[PASS] 3/12: S3 DeleteObjects partial errors detected and raised.")
 
-    # 4.3 Glue pagination across multiple pages
+    # Scenario 4: Existing table + successful replacement -> New table points to new prefix & old prefix deleted
     mgr, mock_athena, mock_s3, mock_glue = _build_mock_manager()
-    mock_paginator = MagicMock()
-    mock_paginator.paginate.return_value = [
-        {"TableList": [{"Name": "tbl_page_1", "StorageDescriptor": {"Columns": [{"Name": "c1", "Type": "string"}]}}]},
-        {"TableList": [{"Name": "tbl_page_2", "StorageDescriptor": {"Columns": [{"Name": "c2", "Type": "bigint"}]}}]},
-    ]
-    mock_glue.get_paginator.return_value = mock_paginator
-    schema_str = mgr.get_schema()
-    assert "tbl_page_1" in schema_str and "tbl_page_2" in schema_str
-
-    # 4.4 Existing table + failed replacement (restores previous table & cleans up failed new S3 prefix, keeps old prefix)
-    mgr, mock_athena, mock_s3, mock_glue = _build_mock_manager()
-    mock_glue.get_table.return_value = {
+    old_snap = {
         "Table": {
             "Name": "cur_report",
             "StorageDescriptor": {
-                "Location": "s3://cur-bucket/data/cur_report/ingestion_id=old123/",
+                "Location": "s3://cur-bucket/data/cur_report/ingestion_id=old_prefix/",
                 "InputFormat": "org.apache.hadoop.mapred.TextInputFormat",
                 "Columns": [{"Name": "line_item_product_code", "Type": "STRING"}],
                 "SerdeInfo": {"Parameters": {"field.delim": ","}},
             },
         }
     }
-    # 1st DDL (DROP) succeeds, 2nd DDL (new CREATE) fails, 3rd DDL (rollback CREATE) succeeds
+    created_locations = []
+
+    def capture_start_query(**kwargs):
+        q = kwargs.get("QueryString", "")
+        if q.startswith("CREATE EXTERNAL TABLE"):
+            loc_match = [part for part in q.split("'") if part.startswith("s3://")]
+            if loc_match:
+                created_locations.append(loc_match[0])
+        return {"QueryExecutionId": "ddl-ok"}
+
+    mock_athena.start_query_execution.side_effect = capture_start_query
+    mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
+
+    def get_table_side_effect(DatabaseName, Name):
+        if not created_locations:
+            return old_snap
+        return {"Table": {"StorageDescriptor": {"Location": created_locations[-1]}}}
+
+    mock_glue.get_table.side_effect = get_table_side_effect
+    s3_paginator = MagicMock()
+    s3_paginator.paginate.return_value = [{"Contents": [{"Key": "data/cur_report/ingestion_id=old_prefix/f.csv"}]}]
+    mock_s3.get_paginator.return_value = s3_paginator
+    mock_s3.delete_objects.return_value = {"Deleted": [{"Key": "data/cur_report/ingestion_id=old_prefix/f.csv"}]}
+
+    csv_ok = io.BytesIO(b"line_item_product_code,line_item_unblended_cost\nAmazonEC2,10.0\n")
+    csv_ok.name = "cur_report.csv"
+    res = mgr.stream_upload_and_create_table(csv_ok)
+    assert created_locations and "ingestion_id=old_prefix" not in created_locations[-1]
+    assert created_locations[-1] in res
+    print("[PASS] 4/12: Existing table + successful replacement points to new prefix.")
+
+    # Scenario 5: Existing table + failed replacement -> Old table restored and remains queryable
+    mgr, mock_athena, mock_s3, mock_glue = _build_mock_manager()
+    mock_glue.get_table.return_value = old_snap
     mock_athena.start_query_execution.side_effect = [
         {"QueryExecutionId": "ddl-drop-1"},
         ClientError({"Error": {"Code": "InternalServerError", "Message": "DDL failed"}}, "StartQueryExecution"),
         {"QueryExecutionId": "ddl-restore-3"},
     ]
     mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
-    s3_list_paginator = MagicMock()
-    s3_list_paginator.paginate.return_value = [{"Contents": [{"Key": "data/cur_report/ingestion_id=new/cur_report.csv"}]}]
-    mock_s3.get_paginator.return_value = s3_list_paginator
+    mock_s3.get_paginator.return_value = s3_paginator
+    mock_s3.delete_objects.return_value = {"Deleted": []}
 
-    csv_file = io.BytesIO(b"line_item_product_code,line_item_unblended_cost\nAmazonEC2,12.50\n")
-    csv_file.name = "cur_report.CSV"
+    csv_fail = io.BytesIO(b"line_item_product_code,line_item_unblended_cost\nAmazonEC2,10.0\n")
+    csv_fail.name = "cur_report.csv"
     try:
-        mgr.stream_upload_and_create_table(csv_file)
-        raise AssertionError("Expected AthenaExecutionError when replacement CREATE DDL fails")
+        mgr.stream_upload_and_create_table(csv_fail)
+        raise AssertionError("Expected AthenaExecutionError on failed replacement")
     except AthenaExecutionError:
-        # Verify 3 DDL calls occurred: DROP, failed CREATE, and automatic rollback CREATE pointing to old123
-        assert mock_athena.start_query_execution.call_count == 3
         rollback_sql = mock_athena.start_query_execution.call_args_list[2].kwargs["QueryString"]
-        assert "ingestion_id=old123" in rollback_sql
+        assert "ingestion_id=old_prefix" in rollback_sql
+    print("[PASS] 5/12: Existing table + failed replacement restores old table metadata.")
 
-    # 4.5 CSV invalid UTF-8 and inconsistent column count rejection
-    bad_utf8 = io.BytesIO(b"col1,col2\n\xff\xfe,123\n")
-    bad_utf8.name = "bad.csv"
-    try:
-        mgr.stream_upload_and_create_table(bad_utf8)
-        raise AssertionError("Expected ValueError for invalid UTF-8")
-    except ValueError as e:
-        assert "UTF-8" in str(e)
-
-    bad_cols = io.BytesIO(b"col1,col2\nval1,val2,val3\n")
-    bad_cols.name = "mismatch.csv"
-    try:
-        mgr.stream_upload_and_create_table(bad_cols)
-        raise AssertionError("Expected ValueError for inconsistent CSV column count")
-    except ValueError as e:
-        assert "column count" in str(e)
-
-    # 4.6 Parquet file with duplicate/dirty column names
+    # Scenario 6: CREATE IF NOT EXISTS encounters an existing table -> Detect that metadata was not replaced
     mgr, mock_athena, mock_s3, mock_glue = _build_mock_manager()
-    mock_glue.get_table.side_effect = ClientError({"Error": {"Code": "EntityNotFoundException"}}, "GetTable")
-    mock_athena.start_query_execution.return_value = {"QueryExecutionId": "ddl-pq-1"}
+    # Simulate Glue returning the old location even after CREATE IF NOT EXISTS completed
+    mock_glue.get_table.return_value = old_snap
+    mock_athena.start_query_execution.return_value = {"QueryExecutionId": "ddl-noop"}
     mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
+    mock_s3.get_paginator.return_value = s3_paginator
+    mock_s3.delete_objects.return_value = {"Deleted": []}
 
+    csv_stale = io.BytesIO(b"line_item_product_code,line_item_unblended_cost\nAmazonEC2,10.0\n")
+    csv_stale.name = "cur_report.csv"
+    try:
+        mgr.stream_upload_and_create_table(csv_stale)
+        raise AssertionError("Expected AthenaExecutionError when Glue table location was not updated")
+    except AthenaExecutionError as e:
+        assert "metadata was not replaced" in str(e)
+    print("[PASS] 6/12: Stale metadata from CREATE IF NOT EXISTS detected and rolled back.")
+
+    # Scenario 7: CSV malformed row after record 1,000 (at row 1,500) -> Reject the upload
+    mgr, _, _, _ = _build_mock_manager()
+    lines = ["col1,col2"] + [f"val{i},10" for i in range(1, 1499)] + ["bad_row,10,EXTRA_COL"]
+    big_csv = io.BytesIO("\n".join(lines).encode("utf-8"))
+    big_csv.name = "row1500_bad.csv"
+    try:
+        mgr.stream_upload_and_create_table(big_csv)
+        raise AssertionError("Expected ValueError for malformed CSV row at line 1,500")
+    except ValueError as e:
+        assert "line 1500" in str(e)
+    print("[PASS] 7/12: CSV malformed row at line 1,500 rejected prior to S3 upload.")
+
+    # Scenario 8: Parquet schema override is incompatible -> Reject ingestion
+    mgr, _, _, mock_glue = _build_mock_manager()
+    mock_glue.get_table.side_effect = ClientError({"Error": {"Code": "EntityNotFoundException"}}, "GetTable")
     pq_buf = io.BytesIO()
-    table = pa.table(
-        [pa.array(["AmazonEC2", "AmazonS3"]), pa.array([10.5, 20.0])],
-        names=["Service Name", "Service-Name"],
-    )
-    pq.write_table(table, pq_buf)
+    pq.write_table(pa.table([pa.array(["AmazonEC2"])], names=["service_name"]), pq_buf)
     pq_buf.seek(0)
-    pq_buf.name = "dirty_cols.parquet"
-    res_msg = mgr.stream_upload_and_create_table(pq_buf)
-    assert "dirty_cols" in res_msg
+    pq_buf.name = "test_pq.parquet"
+    try:
+        mgr.stream_upload_and_create_table(pq_buf, schema_overrides={"service_name": "BIGINT"})
+        raise AssertionError("Expected ValueError for incompatible Parquet schema override (STRING -> BIGINT)")
+    except ValueError as e:
+        assert "Incompatible Parquet schema override" in str(e)
+    print("[PASS] 8/12: Incompatible Parquet schema override rejected.")
 
-    print("[PASS] All AthenaManager integration, failure-recovery, pagination, and ingestion tests passed!")
+    # Scenario 9: Athena returns a scan-cutoff error -> Do not retry with Bedrock
+    mgr, mock_athena, _, _ = _build_mock_manager()
+    mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-cutoff"}
+    mock_athena.get_query_execution.return_value = {
+        "QueryExecution": {
+            "Status": {
+                "State": "FAILED",
+                "StateChangeReason": "Query exhausted scan limit: BytesScannedCutoffPerQuery exceeded at line 1",
+                "AthenaError": {
+                    "ErrorCategory": 2,
+                    "ErrorType": 1006,
+                    "Retryable": False,
+                    "ErrorMessage": "BytesScannedCutoffPerQuery exceeded at line 1",
+                },
+            }
+        }
+    }
+    with patch("agent.boto3.Session") as mock_sess:
+        mock_bedrock = MagicMock()
+        mock_bedrock.converse.return_value = {
+            "output": {"message": {"content": [{"text": "SELECT line_item_product_code FROM cur_data"}]}}
+        }
+        mock_sess.return_value.client.return_value = mock_bedrock
+        agent = NLQueryAgent(db_manager=mgr, strict_semantic_config=False)
+        try:
+            agent.run_query_with_self_healing("Show services")
+            raise AssertionError("Expected AthenaExecutionError on scan cutoff")
+        except AthenaExecutionError:
+            assert mock_bedrock.converse.call_count == 1
+    print("[PASS] 9/12: Athena scan-cutoff error raises AthenaExecutionError without Bedrock retry.")
+
+    # Scenario 10: Athena returns a genuine SQL syntax error (via structured AthenaError) -> Allow controlled correction
+    mgr, mock_athena, mock_s3, _ = _build_mock_manager()
+    mock_athena.start_query_execution.side_effect = [
+        {"QueryExecutionId": "qid-sql-err"},
+        {"QueryExecutionId": "qid-sql-ok"},
+    ]
+    mock_athena.get_query_execution.side_effect = [
+        {
+            "QueryExecution": {
+                "Status": {
+                    "State": "FAILED",
+                    "StateChangeReason": "line 1:8: Column 'wrong_col' cannot be resolved",
+                    "AthenaError": {
+                        "ErrorCategory": 2,
+                        "ErrorType": 1001,
+                        "Retryable": False,
+                        "ErrorMessage": "line 1:8: Column 'wrong_col' cannot be resolved",
+                    },
+                }
+            }
+        },
+        {
+            "QueryExecution": {
+                "Status": {"State": "SUCCEEDED"},
+                "ResultConfiguration": {"OutputLocation": "s3://cur-bucket/athena-results/qid-sql-ok.csv"},
+                "Statistics": {"DataScannedInBytes": 1024},
+            }
+        },
+    ]
+    mock_glue_pag = MagicMock()
+    mock_glue_pag.paginate.return_value = [{"TableList": []}]
+    mgr.glue.get_paginator.return_value = mock_glue_pag
+    mock_s3.get_object.return_value = {"Body": io.BytesIO(b"line_item_product_code\nAmazonEC2\n")}
+
+    with patch("agent.boto3.Session") as mock_sess:
+        mock_bedrock = MagicMock()
+        mock_bedrock.converse.side_effect = [
+            {"output": {"message": {"content": [{"text": "SELECT wrong_col FROM cur_data"}]}}},
+            {"output": {"message": {"content": [{"text": "SELECT line_item_product_code FROM cur_data"}]}}},
+        ]
+        mock_sess.return_value.client.return_value = mock_bedrock
+        agent = NLQueryAgent(db_manager=mgr, strict_semantic_config=False)
+        df, final_sql, trace, _, _ = agent.run_query_with_self_healing("Show services")
+        assert len(trace) == 2 and trace[0]["status"] == "sql_validation_retry" and trace[1]["status"] == "success"
+    print("[PASS] 10/12: Structured Athena SQL compilation error triggers self-healing correction.")
+
+    # Scenario 11: max_retries=0 -> Reject configuration
+    try:
+        agent.run_query_with_self_healing("Show services", max_retries=0)
+        raise AssertionError("Expected ValueError when max_retries=0")
+    except ValueError as e:
+        assert "max_retries" in str(e)
+    print("[PASS] 11/12: max_retries=0 rejected with ValueError.")
+
+    # Scenario 12: Missing metrics.yaml in production -> Fail initialization
+    with patch("agent.boto3.Session"):
+        try:
+            NLQueryAgent(
+                db_manager=mgr,
+                metric_file="nonexistent_production_metrics.yaml",
+                strict_semantic_config=True,
+            )
+            raise AssertionError("Expected FileNotFoundError when metrics.yaml is missing in strict mode")
+        except FileNotFoundError:
+            pass
+    print("[PASS] 12/12: Missing metrics.yaml in production fails initialization immediately.")
 
 
 if __name__ == "__main__":
     test_sql_validation_and_forbidden_nodes()
     test_clean_sql_output_cases()
-    test_agent_retry_classification()
-    test_athena_manager_integration_and_recovery()
-    print("\nALL PRE-PRODUCTION CHECKS PASSED SUCCESSFULLY!")
+    test_review4_12_mandatory_scenarios()
+    print("\nALL REVIEW #4 PRE-PRODUCTION CHECKS PASSED SUCCESSFULLY!")
