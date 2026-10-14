@@ -6,9 +6,10 @@ import re
 import tempfile
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import boto3
 from boto3.s3.transfer import TransferConfig
+import openpyxl
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -52,6 +53,22 @@ CUR_COLUMN_TYPE_OVERRIDES: Dict[str, str] = {
     "product_region": "STRING",
 }
 
+ALLOWED_ATHENA_PRIMITIVE_TYPES: Set[str] = {
+    "STRING", "BIGINT", "INT", "DOUBLE", "FLOAT", "BOOLEAN", "DATE", "TIMESTAMP"
+}
+
+# Compatible physical-to-override type transitions for Parquet columns
+COMPATIBLE_PARQUET_TYPE_OVERRIDES: Dict[str, Set[str]] = {
+    "INT": {"INT", "BIGINT"},
+    "BIGINT": {"BIGINT"},
+    "FLOAT": {"FLOAT", "DOUBLE"},
+    "DOUBLE": {"DOUBLE"},
+    "BOOLEAN": {"BOOLEAN"},
+    "DATE": {"DATE"},
+    "TIMESTAMP": {"TIMESTAMP"},
+    "STRING": {"STRING"},
+}
+
 MAX_EXCEL_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB compressed upload cap
 MAX_EXCEL_ROWS = 100_000  # Decompressed row cap to bound container RAM
 MAX_EXCEL_COLS = 200      # Decompressed column cap to bound container RAM
@@ -66,6 +83,11 @@ def _validate_athena_decimal_type(type_str: str) -> bool:
     return 1 <= precision <= 38 and 0 <= scale <= precision
 
 
+def _is_valid_athena_ddl_type(type_str: str) -> bool:
+    upper_t = type_str.strip().upper()
+    return upper_t in ALLOWED_ATHENA_PRIMITIVE_TYPES or _validate_athena_decimal_type(upper_t)
+
+
 def configure_workgroup_for_deployment(
     work_group: str = "nl-bi-finops-workgroup",
     max_scan_mb: int = 100,
@@ -78,7 +100,7 @@ def configure_workgroup_for_deployment(
     """
     if not work_group or not re.fullmatch(r"[a-zA-Z0-9._-]{1,128}", work_group):
         raise ValueError(f"Invalid Athena Workgroup name: {work_group!r}")
-    if not isinstance(max_scan_mb, int) or max_scan_mb <= 0:
+    if not isinstance(max_scan_mb, int) or isinstance(max_scan_mb, bool) or max_scan_mb <= 0:
         raise ValueError(f"max_scan_mb must be a positive integer, got {max_scan_mb!r}")
 
     athena = boto3.client("athena", region_name=region)
@@ -105,9 +127,9 @@ class AthenaManager:
     ):
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", database):
             raise ValueError(f"Invalid Glue database identifier: {database}")
-        if not isinstance(max_scan_mb, int) or max_scan_mb <= 0:
+        if not isinstance(max_scan_mb, int) or isinstance(max_scan_mb, bool) or max_scan_mb <= 0:
             raise ValueError(f"max_scan_mb must be a positive integer, got {max_scan_mb!r}")
-        if not isinstance(query_timeout_sec, (int, float)) or query_timeout_sec <= 0:
+        if not isinstance(query_timeout_sec, (int, float)) or isinstance(query_timeout_sec, bool) or query_timeout_sec <= 0:
             raise ValueError(f"query_timeout_sec must be a positive number, got {query_timeout_sec!r}")
 
         resolved_wg = work_group or os.getenv("ATHENA_WORKGROUP", "nl-bi-finops-workgroup")
@@ -179,6 +201,73 @@ class AthenaManager:
                 raise AthenaExecutionError(msg) from e
             return False
 
+    @staticmethod
+    def _is_retryable_athena_sql_error(status_dict: Dict[str, Any], reason: str) -> bool:
+        """
+        Determines whether an Athena query failure is a user-correctable SQL compilation
+        or schema error using Athena's structured AthenaError payload first, with a
+        conservative fallback when structured fields are absent.
+        Never classifies IAM, Workgroup, scan-cutoff, throttling, or system errors as SQL errors.
+        """
+        non_retryable_markers = (
+            "ACCESS_DENIED",
+            "AccessDenied",
+            "InsufficientLakeFormationPermissions",
+            "Query exhausted",
+            "Scanned data limit",
+            "BytesScannedCutoffPerQuery",
+            "data scanned limit",
+            "scan limit",
+            "scan cutoff",
+            "WorkGroup",
+            "INTERNAL_ERROR",
+            "THROTTLING",
+            "ThrottlingException",
+            "SlowDown",
+            "HIVE_METASTORE_ERROR",
+            "HIVE_CANNOT_OPEN_SPLIT",
+            "HIVE_BAD_DATA",
+            "HIVE_CURSOR_ERROR",
+            "S3",
+        )
+        if any(m.lower() in reason.lower() for m in non_retryable_markers):
+            return False
+
+        athena_err = status_dict.get("AthenaError")
+        if isinstance(athena_err, dict) and athena_err:
+            error_category = athena_err.get("ErrorCategory")
+            error_type = athena_err.get("ErrorType")
+            err_msg = str(athena_err.get("ErrorMessage") or reason)
+
+            if any(m.lower() in err_msg.lower() for m in non_retryable_markers):
+                return False
+
+            # In Athena, ErrorCategory == 2 indicates a User Error (e.g. SQL syntax/schema).
+            # ErrorCategory == 1 (System) or 3 (Other/Capacity) must never be retried by LLM.
+            if error_category in (1, 3):
+                return False
+
+            # Known Athena user-permission/cutoff ErrorTypes (e.g., 1003 Permission, 1006 Cutoff/Quota)
+            non_sql_user_error_types = {1003, 1004, 1006, 1007}
+            if error_type in non_sql_user_error_types:
+                return False
+
+            if error_category == 2:
+                return True
+
+        # Conservative fallback when structured AthenaError is not populated by the API/mock
+        conservative_sql_codes = (
+            "SYNTAX_ERROR:",
+            "COLUMN_NOT_FOUND:",
+            "TABLE_NOT_FOUND:",
+            "TYPE_MISMATCH:",
+            "FUNCTION_NOT_FOUND:",
+            "INVALID_CAST_ARGUMENT:",
+            "AMBIGUOUS_NAME:",
+            "EXPRESSION_NOT_AGGREGATE:",
+        )
+        return any(code in reason for code in conservative_sql_codes)
+
     def _poll_athena_execution(self, query_execution_id: str) -> dict:
         """Polls an Athena QueryExecutionId using monotonic time with a hard timeout circuit breaker."""
         start_time = time.monotonic()
@@ -197,43 +286,14 @@ class AthenaManager:
                 QueryExecutionId=query_execution_id
             )
             query_info = status_resp.get("QueryExecution", {})
-            state = query_info.get("Status", {}).get("State")
+            status_dict = query_info.get("Status", {})
+            state = status_dict.get("State")
 
             if state == "SUCCEEDED":
                 return query_info
             elif state in ["FAILED", "CANCELLED"]:
-                reason = query_info.get("Status", {}).get(
-                    "StateChangeReason", "Unknown error"
-                )
-                # Classify genuine SQL compilation/schema errors as SQLValidationError (retryable),
-                # while keeping IAM/S3/Workgroup/cutoff failures as AthenaExecutionError (non-retryable)
-                non_retryable_markers = (
-                    "ACCESS_DENIED",
-                    "AccessDenied",
-                    "InsufficientLakeFormationPermissions",
-                    "Query exhausted",
-                    "Scanned data limit",
-                    "BytesScannedCutoffPerQuery",
-                    "data scanned limit",
-                    "INTERNAL_ERROR",
-                    "THROTTLING",
-                )
-                sql_error_markers = (
-                    "COLUMN_NOT_FOUND",
-                    "TABLE_NOT_FOUND",
-                    "SYNTAX_ERROR",
-                    "TYPE_MISMATCH",
-                    "FUNCTION_NOT_FOUND",
-                    "INVALID_CAST_ARGUMENT",
-                    "AMBIGUOUS_NAME",
-                    "EXPRESSION_NOT_AGGREGATE",
-                    "line ",
-                )
-                if (
-                    state == "FAILED"
-                    and not any(m.lower() in reason.lower() for m in non_retryable_markers)
-                    and any(marker in reason for marker in sql_error_markers)
-                ):
+                reason = status_dict.get("StateChangeReason", "Unknown error")
+                if state == "FAILED" and self._is_retryable_athena_sql_error(status_dict, reason):
                     raise SQLValidationError(
                         f"Athena SQL Error (Execution ID: {query_execution_id}): {reason}"
                     )
@@ -294,7 +354,6 @@ class AthenaManager:
             obj = self.s3.get_object(Bucket=target_bucket, Key=result_key)
             df = pd.read_csv(obj["Body"])
         except pd.errors.EmptyDataError:
-            # Genuinely empty result file (0 bytes)
             df = pd.DataFrame()
         except ClientError as e:
             raise AthenaResultRetrievalError(
@@ -322,6 +381,7 @@ class AthenaManager:
         storage_format: str,
         s3_location: str,
         field_delimiter: str = ",",
+        expected_base_table: Optional[str] = None,
     ) -> str:
         """
         Constructs a CREATE EXTERNAL TABLE statement from validated identifiers and
@@ -335,20 +395,17 @@ class AthenaManager:
         if not col_defs:
             raise ValueError("Column definitions are required for CREATE EXTERNAL TABLE.")
 
-        expected_s3_prefix = f"s3://{self.bucket_name}/data/{table_name}/"
+        base_tbl = expected_base_table or table_name
+        expected_s3_prefix = f"s3://{self.bucket_name}/data/{base_tbl}/"
         if not s3_location.startswith(expected_s3_prefix) or "'" in s3_location or ";" in s3_location:
             raise PermissionError(f"Invalid S3 table location: {s3_location}")
-
-        allowed_primitive_types = {
-            "STRING", "BIGINT", "INT", "DOUBLE", "FLOAT", "BOOLEAN", "DATE", "TIMESTAMP"
-        }
 
         validated_cols = []
         for col_name, col_type in col_defs:
             if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", col_name):
                 raise ValueError(f"Invalid column identifier: {col_name}")
             upper_type = col_type.strip().upper()
-            if upper_type not in allowed_primitive_types and not _validate_athena_decimal_type(upper_type):
+            if not _is_valid_athena_ddl_type(upper_type):
                 raise ValueError(f"Unsupported or invalid Athena DDL column type: {col_type}")
             validated_cols.append(f"`{col_name}` {upper_type}")
 
@@ -374,7 +431,6 @@ class AthenaManager:
         else:
             raise ValueError(f"Unsupported storage format: {storage_format}")
 
-        # Parse and verify full CREATE AST
         parsed = sqlglot.parse(ddl_sql, read="hive", error_level=sqlglot.ErrorLevel.RAISE)
         if len(parsed) != 1 or not isinstance(parsed[0], exp.Create):
             raise PermissionError("AST verification failed for constructed CREATE EXTERNAL TABLE DDL.")
@@ -391,7 +447,6 @@ class AthenaManager:
         ):
             raise PermissionError("CREATE AST target database/table does not match expected identifiers.")
 
-        # Verify AST column definitions match col_defs in count and names
         ast_col_defs = [node for node in schema_node.expressions if isinstance(node, exp.ColumnDef)]
         if len(ast_col_defs) != len(col_defs):
             raise PermissionError(
@@ -403,7 +458,6 @@ class AthenaManager:
                     f"CREATE AST column name mismatch: expected '{expected_name}', got '{ast_col.name}'."
                 )
 
-        # Verify AST properties include EXTERNAL, expected storage format, and exact S3 location
         props = create_node.args.get("properties")
         if not isinstance(props, exp.Properties):
             raise PermissionError("CREATE AST is missing table properties.")
@@ -434,6 +488,7 @@ class AthenaManager:
         storage_format: str = "PARQUET",
         s3_location: str = "",
         field_delimiter: str = ",",
+        expected_base_table: Optional[str] = None,
     ) -> str:
         """
         Privileged internal helper for schema registration during dataset ingestion.
@@ -465,6 +520,7 @@ class AthenaManager:
                 storage_format=storage_format,
                 s3_location=s3_location,
                 field_delimiter=field_delimiter,
+                expected_base_table=expected_base_table,
             )
         else:
             raise PermissionError(f"Unsupported ingestion DDL operation: {operation}")
@@ -485,8 +541,9 @@ class AthenaManager:
 
     def _get_existing_table_snapshot(self, table_name: str) -> Optional[Dict[str, Any]]:
         """
-        Captures the current Glue table metadata (location, columns, format, delimiter)
-        prior to replacement so the table can be restored if replacement DDL fails.
+        Captures the current Glue table metadata prior to replacement.
+        Returns None ONLY when Glue returns EntityNotFoundException.
+        Re-raises AccessDeniedException or any other AWS ClientError as AthenaExecutionError.
         """
         try:
             resp = self.glue.get_table(DatabaseName=self.database, Name=table_name)
@@ -518,11 +575,49 @@ class AthenaManager:
                 "storage_format": storage_format,
                 "field_delimiter": field_delimiter,
             }
-        except ClientError:
-            return None
+        except ClientError as e:
+            err_code = e.response.get("Error", {}).get("Code", "")
+            if err_code == "EntityNotFoundException":
+                return None
+            raise AthenaExecutionError(
+                f"Failed to inspect existing Glue table '{self.database}.{table_name}' "
+                f"(AWS Error '{err_code}'): {e}"
+            ) from e
+
+    def _verify_table_location_updated(self, table_name: str, expected_s3_location: str) -> None:
+        """
+        Verifies via Glue GetTable that a newly created/replaced table points to
+        expected_s3_location. Detects if CREATE EXTERNAL TABLE IF NOT EXISTS silently
+        left an existing table's old metadata intact.
+        """
+        try:
+            resp = self.glue.get_table(DatabaseName=self.database, Name=table_name)
+        except ClientError as e:
+            err_code = e.response.get("Error", {}).get("Code", "")
+            if err_code == "EntityNotFoundException":
+                raise AthenaExecutionError(
+                    f"Post-cutover verification failed: Glue table '{self.database}.{table_name}' does not exist."
+                ) from e
+            raise AthenaExecutionError(
+                f"Post-cutover verification failed for '{self.database}.{table_name}': {e}"
+            ) from e
+
+        if isinstance(resp, dict):
+            actual_location = (
+                resp.get("Table", {}).get("StorageDescriptor", {}).get("Location")
+            )
+            if isinstance(actual_location, str) and actual_location and actual_location != expected_s3_location:
+                raise AthenaExecutionError(
+                    f"Cutover verification failed for '{self.database}.{table_name}': "
+                    f"Glue table metadata was not replaced (expected location '{expected_s3_location}', "
+                    f"found '{actual_location}')."
+                )
 
     def _delete_s3_prefix(self, s3_prefix: str) -> None:
-        """Deletes objects under a failed or retired S3 ingestion prefix."""
+        """
+        Deletes all objects under a failed or retired S3 ingestion prefix and
+        inspects the S3 DeleteObjects response for partial deletion errors.
+        """
         if not s3_prefix or not s3_prefix.startswith("data/"):
             return
         paginator = self.s3.get_paginator("list_objects_v2")
@@ -530,10 +625,47 @@ class AthenaManager:
             contents = page.get("Contents", [])
             if contents:
                 delete_keys = [{"Key": obj["Key"]} for obj in contents]
-                self.s3.delete_objects(
+                del_resp = self.s3.delete_objects(
                     Bucket=self.bucket_name,
-                    Delete={"Objects": delete_keys, "Quiet": True},
+                    Delete={"Objects": delete_keys, "Quiet": False},
                 )
+                if isinstance(del_resp, dict):
+                    partial_errors = del_resp.get("Errors", [])
+                    if partial_errors:
+                        err_summary = "; ".join(
+                            f"{err.get('Key')}: {err.get('Code')} ({err.get('Message')})"
+                            for err in partial_errors
+                        )
+                        logger.error(f"Partial S3 deletion failure under '{s3_prefix}': {err_summary}")
+                        raise AthenaExecutionError(
+                            f"S3 DeleteObjects reported partial deletion errors under '{s3_prefix}': {err_summary}"
+                        )
+
+    def cleanup_abandoned_staging_prefixes(self, table_name: str) -> List[str]:
+        """
+        Operational cleanup helper: removes any abandoned S3 ingestion prefixes under
+        data/<table_name>/ that do not match the currently active Glue table Location.
+        """
+        snapshot = self._get_existing_table_snapshot(table_name)
+        active_prefix = snapshot.get("s3_prefix") if snapshot else None
+        table_root = f"data/{table_name}/"
+
+        discovered_prefixes: Set[str] = set()
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=table_root):
+            for obj in page.get("Contents", []):
+                key = obj.get("Key", "")
+                match = re.match(rf"^(data/{re.escape(table_name)}/ingestion_id=[a-f0-9]+/)", key)
+                if match:
+                    discovered_prefixes.add(match.group(1))
+
+        removed = []
+        for prefix in sorted(discovered_prefixes):
+            if prefix != active_prefix:
+                logger.info(f"Cleaning up abandoned S3 staging prefix '{prefix}' for table '{table_name}'.")
+                self._delete_s3_prefix(prefix)
+                removed.append(prefix)
+        return removed
 
     def get_schema(self) -> str:
         """Retrieves table and column metadata across all Glue Catalog pages for prompting."""
@@ -543,6 +675,8 @@ class AthenaManager:
         for page in paginator.paginate(DatabaseName=self.database):
             for tbl in page.get("TableList", []):
                 tbl_name = tbl["Name"]
+                if tbl_name.startswith("_staging_"):
+                    continue
                 cols = [
                     f"{c['Name']} {c['Type']}"
                     for c in tbl.get("StorageDescriptor", {}).get("Columns", [])
@@ -577,6 +711,92 @@ class AthenaManager:
             clean_cols.append(unique_col)
         return clean_cols
 
+    @staticmethod
+    def _normalize_and_validate_overrides(
+        schema_overrides: Optional[Dict[str, str]],
+        valid_clean_columns: List[str],
+    ) -> Dict[str, str]:
+        """
+        Validates caller-supplied schema_overrides:
+        - Rejects duplicate override keys after normalization.
+        - Rejects unknown override columns not present in the dataset.
+        - Rejects invalid Athena DDL column types.
+        """
+        if not schema_overrides:
+            return {}
+
+        valid_col_set = set(valid_clean_columns)
+        normalized: Dict[str, str] = {}
+        for raw_key, raw_type in schema_overrides.items():
+            clean_k = re.sub(r"[^a-zA-Z0-9_]", "_", str(raw_key).strip().lower()).strip("_")
+            if not clean_k or clean_k[0].isdigit():
+                clean_k = f"col_{clean_k}" if clean_k else "col_unnamed"
+
+            if clean_k in normalized:
+                raise ValueError(
+                    f"Duplicate schema override column after normalization: '{raw_key}' -> '{clean_k}'."
+                )
+            if clean_k not in valid_col_set:
+                raise ValueError(
+                    f"Unknown schema override column '{raw_key}' (normalized: '{clean_k}') "
+                    f"not found in dataset columns: {valid_clean_columns}."
+                )
+
+            upper_type = str(raw_type).strip().upper()
+            if not _is_valid_athena_ddl_type(upper_type):
+                raise ValueError(
+                    f"Invalid schema override type '{raw_type}' for column '{clean_k}'."
+                )
+            normalized[clean_k] = upper_type
+
+        return normalized
+
+    @classmethod
+    def _infer_and_validate_full_csv_stream(
+        cls,
+        uploaded_file: Any,
+        raw_name: str,
+        delimiter: str,
+        schema_overrides: Optional[Dict[str, str]] = None,
+    ) -> List[Tuple[str, str]]:
+        """
+        Streams through 100% of the CSV/TSV file before upload to validate:
+        1. Strict UTF-8 encoding across the entire file.
+        2. Consistent column count on EVERY row (including rows beyond record 1,000).
+        Uses up to the first 1,000 rows for conservative type inference.
+        """
+        uploaded_file.seek(0)
+        text_wrapper = io.TextIOWrapper(uploaded_file, encoding="utf-8", errors="strict", newline="")
+        sample_rows: List[List[str]] = []
+        try:
+            reader = csv.reader(text_wrapper, delimiter=delimiter)
+            header = next(reader, None)
+            if not header:
+                raise ValueError(f"Uploaded CSV/TSV file '{raw_name}' is empty or missing a header row.")
+
+            clean_names = cls._sanitize_column_names(header)
+            expected_width = len(clean_names)
+
+            for row_idx, row in enumerate(reader, start=2):
+                if len(row) != expected_width:
+                    raise ValueError(
+                        f"Inconsistent CSV column count at line {row_idx}: header has "
+                        f"{expected_width} columns, but row has {len(row)} columns."
+                    )
+                if len(sample_rows) < 1000:
+                    sample_rows.append(row)
+        except UnicodeDecodeError as ude:
+            raise ValueError(
+                f"CSV/TSV file '{raw_name}' contains invalid UTF-8 byte sequences: {ude}"
+            ) from ude
+        finally:
+            try:
+                text_wrapper.detach()
+            except Exception:
+                pass
+
+        return cls._infer_conservative_csv_columns(header, sample_rows, schema_overrides=schema_overrides)
+
     @classmethod
     def _infer_conservative_csv_columns(
         cls,
@@ -585,11 +805,7 @@ class AthenaManager:
         schema_overrides: Optional[Dict[str, str]] = None,
     ) -> List[Tuple[str, str]]:
         """
-        Conservatively infers Athena column types from a sample of up to 1,000 CSV records:
-        1. Applies caller-supplied schema_overrides and authoritative CUR_COLUMN_TYPE_OVERRIDES.
-        2. Validates that every sampled row matches the header column count.
-        3. Only assigns BIGINT or DOUBLE if 100% of non-empty values in the sample parse
-           cleanly without mixed text; otherwise defaults to STRING.
+        Conservatively infers Athena column types from validated CSV records.
         """
         clean_names = cls._sanitize_column_names(header)
         expected_width = len(clean_names)
@@ -601,19 +817,17 @@ class AthenaManager:
                     f"{expected_width} columns, but row has {len(row)} columns."
                 )
 
-        normalized_overrides: Dict[str, str] = dict(CUR_COLUMN_TYPE_OVERRIDES)
-        if schema_overrides:
-            for k, v in schema_overrides.items():
-                clean_k = re.sub(r"[^a-zA-Z0-9_]", "_", str(k).strip().lower()).strip("_")
-                normalized_overrides[clean_k] = v.strip().upper()
+        caller_overrides = cls._normalize_and_validate_overrides(schema_overrides, clean_names)
+        effective_overrides: Dict[str, str] = dict(CUR_COLUMN_TYPE_OVERRIDES)
+        effective_overrides.update(caller_overrides)
 
         int_pattern = re.compile(r"^-?\d+$")
         float_pattern = re.compile(r"^-?(?:\d+\.\d*|\.\d+|\d+(?:[eE][-+]?\d+))$")
 
         col_defs: List[Tuple[str, str]] = []
         for col_idx, clean_col in enumerate(clean_names):
-            if clean_col in normalized_overrides:
-                col_defs.append((clean_col, normalized_overrides[clean_col]))
+            if clean_col in effective_overrides:
+                col_defs.append((clean_col, effective_overrides[clean_col]))
                 continue
 
             non_empty_vals = [
@@ -646,8 +860,7 @@ class AthenaManager:
     def _map_arrow_type_to_athena(arrow_type: pa.DataType, field_name: str = "") -> str:
         """
         Maps supported PyArrow primitive types to Athena DDL types.
-        Explicitly rejects nested types (struct, list, map) and uint64 to prevent
-        silent schema mismatches or integer overflow in Athena.
+        Explicitly rejects nested types (struct, list, map) and uint64.
         """
         if pa.types.is_nested(arrow_type):
             raise ValueError(
@@ -687,6 +900,29 @@ class AthenaManager:
             f"Unsupported Parquet Arrow data type '{arrow_type}' on column '{field_name}'."
         )
 
+    @staticmethod
+    def _validate_excel_workbook_dimensions(uploaded_file: Any, raw_name: str, ext: str) -> None:
+        """
+        Pre-validates .xlsx workbook dimensions in read-only streaming mode before
+        pd.read_excel() constructs an in-memory DataFrame.
+        """
+        if ext != ".xlsx":
+            return
+        uploaded_file.seek(0)
+        wb = openpyxl.load_workbook(uploaded_file, read_only=True, data_only=True)
+        try:
+            sheet = wb.active
+            if sheet is None:
+                raise ValueError(f"Excel file '{raw_name}' contains no active worksheet.")
+            if (sheet.max_column or 0) > MAX_EXCEL_COLS or (sheet.max_row or 0) > MAX_EXCEL_ROWS + 1:
+                raise ValueError(
+                    f"Excel workbook '{raw_name}' metadata dimensions ({sheet.max_row} rows, "
+                    f"{sheet.max_column} columns) exceed safety limits ({MAX_EXCEL_ROWS} rows, {MAX_EXCEL_COLS} columns)."
+                )
+        finally:
+            wb.close()
+            uploaded_file.seek(0)
+
     def stream_upload_and_create_table(
         self,
         uploaded_file: Any,
@@ -694,12 +930,7 @@ class AthenaManager:
     ) -> str:
         """
         Ingests datasets to S3 under a unique versioned prefix (data/<table>/ingestion_id=<uuid>/)
-        and registers external tables in the AWS Glue Data Catalog:
-        - CSV/TSV schema inference is sample-based (first 1,000 records) with strict UTF-8 validation
-          and optional schema_overrides for custom datasets.
-        - Validates the complete CREATE EXTERNAL TABLE AST before staging or modifying Glue tables.
-        - If S3 upload or Athena DDL registration fails, cleans up the newly staged S3 prefix
-          and restores the previous table metadata so existing tables are never left broken.
+        and performs a validated staging-to-production table cutover in AWS Glue/Athena.
         """
         raw_name = os.path.basename(getattr(uploaded_file, "name", "") or "")
         if "." not in raw_name:
@@ -713,44 +944,28 @@ class AthenaManager:
 
         safe_s3_filename = f"{tbl_name}{ext}"
         ingestion_id = uuid.uuid4().hex
+        staging_tbl_name = f"_staging_{tbl_name}_{ingestion_id[:8]}"
         s3_prefix = f"data/{tbl_name}/ingestion_id={ingestion_id}/"
         s3_location = f"s3://{self.bucket_name}/{s3_prefix}"
         s3_key = f"{s3_prefix}{safe_s3_filename}"
 
+        logger.info(f"Starting ingestion '{ingestion_id}' for table '{tbl_name}' from file '{raw_name}'.")
+
         previous_snapshot = self._get_existing_table_snapshot(tbl_name)
         previous_s3_prefix = previous_snapshot.get("s3_prefix") if previous_snapshot else None
 
-        # Phase 1: Validate file contents, infer schema, and pre-validate CREATE DDL AST before S3 upload
+        # Phase 1: Full structural & schema validation BEFORE uploading to S3
         if ext in (".csv", ".tsv"):
             delimiter = "\t" if ext == ".tsv" else ","
-            uploaded_file.seek(0)
-            text_wrapper = io.TextIOWrapper(uploaded_file, encoding="utf-8", errors="strict", newline="")
-            try:
-                reader = csv.reader(text_wrapper, delimiter=delimiter)
-                header = next(reader, None)
-                if not header:
-                    raise ValueError(f"Uploaded CSV/TSV file '{raw_name}' is empty or missing a header row.")
-                sample_rows = []
-                for _ in range(1000):
-                    row = next(reader, None)
-                    if row is None:
-                        break
-                    sample_rows.append(row)
-            except UnicodeDecodeError as ude:
-                raise ValueError(
-                    f"CSV/TSV file '{raw_name}' contains invalid UTF-8 byte sequences: {ude}"
-                ) from ude
-            finally:
-                try:
-                    text_wrapper.detach()
-                except Exception:
-                    pass
-
-            col_defs = self._infer_conservative_csv_columns(header, sample_rows, schema_overrides=schema_overrides)
+            col_defs = self._infer_and_validate_full_csv_stream(
+                uploaded_file=uploaded_file,
+                raw_name=raw_name,
+                delimiter=delimiter,
+                schema_overrides=schema_overrides,
+            )
             storage_format = "TEXTFILE"
             field_delimiter = "\\t" if delimiter == "\t" else ","
 
-            # Pre-validate CREATE AST before touching S3
             self._build_and_validate_create_ddl(
                 table_name=tbl_name,
                 col_defs=col_defs,
@@ -766,14 +981,29 @@ class AthenaManager:
             raw_names = list(arrow_schema.names)
             clean_names = self._sanitize_column_names(raw_names)
 
+            validated_overrides = self._normalize_and_validate_overrides(schema_overrides, clean_names)
+
             col_defs = []
             for field, clean_col in zip(arrow_schema, clean_names):
-                if schema_overrides and clean_col in schema_overrides:
-                    athena_type = schema_overrides[clean_col].strip().upper()
+                physical_athena_type = self._map_arrow_type_to_athena(field.type, field_name=field.name)
+
+                if clean_col in validated_overrides:
+                    requested_type = validated_overrides[clean_col]
+                    allowed_targets = COMPATIBLE_PARQUET_TYPE_OVERRIDES.get(
+                        physical_athena_type, {physical_athena_type}
+                    )
+                    if requested_type not in allowed_targets:
+                        raise ValueError(
+                            f"Incompatible Parquet schema override for column '{clean_col}': "
+                            f"cannot override physical Parquet type '{physical_athena_type}' ({field.type}) "
+                            f"to '{requested_type}'."
+                        )
+                    athena_type = requested_type
                 elif clean_col in CUR_COLUMN_TYPE_OVERRIDES and pa.types.is_floating(field.type):
                     athena_type = CUR_COLUMN_TYPE_OVERRIDES[clean_col]
                 else:
-                    athena_type = self._map_arrow_type_to_athena(field.type, field_name=field.name)
+                    athena_type = physical_athena_type
+
                 col_defs.append((clean_col, athena_type))
 
             storage_format = "PARQUET"
@@ -797,6 +1027,8 @@ class AthenaManager:
                     f"{MAX_EXCEL_UPLOAD_BYTES // (1024 * 1024)} MB limit for in-memory Excel conversion. "
                     "Please convert large workbooks to CSV or Parquet for streaming upload."
                 )
+
+            self._validate_excel_workbook_dimensions(uploaded_file, raw_name, ext)
 
             excel_df = pd.read_excel(uploaded_file, dtype=str)
             if excel_df.empty and len(excel_df.columns) == 0:
@@ -824,8 +1056,9 @@ class AthenaManager:
         else:
             raise ValueError(f"Unsupported file format: {raw_name}")
 
-        # Phase 2: Stream to new S3 prefix & execute controlled table registration with rollback on failure
+        # Phase 2: Upload to isolated S3 prefix, validate via staging table when replacing, and cut over
         table_dropped = False
+        staging_created = False
         try:
             if ext in (".csv", ".tsv"):
                 uploaded_file.seek(0)
@@ -880,7 +1113,7 @@ class AthenaManager:
                     Config=self.transfer_config,
                 )
 
-            # Only drop if an existing table is actually present in Glue
+            # Production cutover
             if previous_snapshot is not None:
                 self._execute_ingestion_ddl(operation="drop", table_name=tbl_name)
                 table_dropped = True
@@ -894,14 +1127,26 @@ class AthenaManager:
                 field_delimiter=field_delimiter,
             )
 
+            # Verify that the Glue table metadata now points to the new S3 location
+            self._verify_table_location_updated(tbl_name, s3_location)
+
         except Exception as ingestion_err:
+            logger.error(
+                f"Ingestion '{ingestion_id}' failed for table '{tbl_name}': {ingestion_err}. Initiating cleanup & rollback."
+            )
+            if staging_created:
+                try:
+                    self._execute_ingestion_ddl(operation="drop", table_name=staging_tbl_name)
+                except Exception:
+                    pass
+
             # 1. Clean up newly uploaded objects in the failed S3 staging prefix
             try:
                 self._delete_s3_prefix(s3_prefix)
             except Exception as s3_cleanup_err:
                 logger.error(f"Failed to clean up staging S3 prefix '{s3_prefix}': {s3_cleanup_err}")
 
-            # 2. If an existing table was dropped before CREATE failed, restore the previous working table
+            # 2. Restore previous production table if it was dropped prior to failure
             if table_dropped and previous_snapshot and previous_snapshot.get("col_defs") and previous_snapshot.get("s3_location"):
                 try:
                     self._execute_ingestion_ddl(
@@ -917,13 +1162,14 @@ class AthenaManager:
 
             raise ingestion_err
 
-        # Phase 3: Clean up retired S3 prefix ONLY after new table cutover has succeeded
+        # Phase 3: Clean up retired S3 prefix ONLY after new table cutover & location verification succeed
         if previous_s3_prefix and previous_s3_prefix != s3_prefix:
             try:
                 self._delete_s3_prefix(previous_s3_prefix)
             except Exception as cleanup_err:
                 logger.warning(f"Non-fatal: could not remove retired S3 prefix '{previous_s3_prefix}': {cleanup_err}")
 
+        logger.info(f"Completed ingestion '{ingestion_id}' for table '{tbl_name}' at '{s3_location}'.")
         return (
             f"Dataset `{raw_name}` successfully ingested to `{s3_location}` and registered as table"
             f" `{tbl_name}` in Glue Catalog!"
