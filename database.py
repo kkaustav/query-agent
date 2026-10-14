@@ -20,9 +20,25 @@ class SQLValidationError(ValueError):
 
 class QueryCostExceededError(SQLValidationError):
     """
-    Raised when an AST cost guardrail (such as SELECT *) or EXPLAIN plan
-    exceeds execution safety thresholds. Subclasses SQLValidationError (and ValueError)
-    so callers can distinguish retryable cost violations from syntax errors and PermissionErrors.
+    Base class for query cost guardrail violations. Subclasses SQLValidationError
+    (and ValueError) so callers can distinguish retryable cost issues from syntax
+    errors and non-retryable PermissionErrors.
+    """
+    pass
+
+
+class ProjectionCostExceededError(QueryCostExceededError):
+    """
+    Raised when any SELECT node in the AST contains a wildcard projection
+    ('SELECT *' or 'SELECT table.*').
+    """
+    pass
+
+
+class ExecutionPlanCostExceededError(QueryCostExceededError):
+    """
+    Raised when a database EXPLAIN query plan exceeds configured cost or
+    unindexed table-scan safety thresholds.
     """
     pass
 
@@ -30,7 +46,7 @@ class QueryCostExceededError(SQLValidationError):
 class AthenaExecutionError(RuntimeError):
     """
     Raised when Amazon Athena or AWS infrastructure encounters a non-retryable
-    runtime, permission, workgroup, or service error.
+    runtime, permission, workgroup, scan-cutoff, or service error.
     """
     pass
 
@@ -139,8 +155,8 @@ def validate_sql_query(sql: str, dialect: str = "trino") -> None:
     - PermissionError (non-retryable): Empty query, multi-statement query,
       repeated trailing semicolons (e.g. 'SELECT 1;;'), or any DDL/DML/administrative
       statement (DROP, DELETE, UPDATE, CREATE, TRUNCATE, GRANT, REVOKE, CALL, SET, USE, etc.).
-    - QueryCostExceededError (retryable): Any SELECT node in the AST (top-level, CTE,
-      or subquery) projects '*' or 'table.*'.
+    - ProjectionCostExceededError (retryable subclass of QueryCostExceededError):
+      Any SELECT node in the AST (top-level, CTE, or subquery) projects '*' or 'table.*'.
     - SQLValidationError (retryable subclass of ValueError): Malformed SQL syntax or
       empty SELECT projection list (e.g. 'SELECT FROM cur_data').
     """
@@ -251,7 +267,7 @@ def validate_sql_query(sql: str, dialect: str = "trino") -> None:
             if isinstance(target, exp.Star) or (
                 isinstance(target, exp.Column) and isinstance(target.this, exp.Star)
             ):
-                raise QueryCostExceededError(
+                raise ProjectionCostExceededError(
                     "FinOps Cost Guardrail: Wildcard projections ('SELECT *' or 'SELECT table.*') "
                     "are blocked across all queries, CTEs, and subqueries to prevent full-column scans. "
                     "Please explicitly list only the required columns."
@@ -261,7 +277,7 @@ def validate_sql_query(sql: str, dialect: str = "trino") -> None:
 def is_read_only_query(sql: str, dialect: str = "trino") -> bool:
     """
     Returns True only if the query is syntactically valid and read-only
-    (including read-only queries blocked by QueryCostExceededError).
+    (including read-only queries blocked by ProjectionCostExceededError / QueryCostExceededError).
     Returns False for PermissionError (DDL/DML/multi-statement) and ValueError (invalid syntax).
     """
     try:
@@ -382,7 +398,7 @@ class DatabaseManager:
     def validate_query(self, sql: str) -> Tuple[bool, str]:
         """
         Validates query read-only status, syntax, and recursive wildcard rules via AST.
-        Raises PermissionError for security violations, QueryCostExceededError for wildcards,
+        Raises PermissionError for security violations, ProjectionCostExceededError for wildcards,
         and SQLValidationError for syntax errors.
         """
         validate_sql_query(sql, dialect=self.dialect)
@@ -391,7 +407,10 @@ class DatabaseManager:
     def inspect_query_cost(
         self, sql: str, max_cost_pg: float = 25000.0, max_cost_mysql: float = 1000.0
     ) -> Dict[str, Any]:
-        """Evaluates database execution plans before running queries to block expensive runaway scans."""
+        """
+        Evaluates database execution plans before running queries to block expensive runaway scans.
+        Raises ExecutionPlanCostExceededError when estimated plan costs exceed thresholds.
+        """
         cleaned_sql = sql.strip().rstrip(";")
         with self.engine.connect() as conn:
             if self.dialect in ("postgresql", "postgres"):
@@ -402,7 +421,7 @@ class DatabaseManager:
                 total_cost = float(plan_node.get("Total Cost", 0.0))
 
                 if total_cost > max_cost_pg:
-                    raise QueryCostExceededError(
+                    raise ExecutionPlanCostExceededError(
                         f"PostgreSQL Total Cost estimated at {total_cost:.1f} (limit: {max_cost_pg:.1f})."
                     )
                 return {"dialect": "postgres", "estimated_cost": total_cost, "raw_plan": plan_data}
@@ -415,7 +434,7 @@ class DatabaseManager:
                 total_cost = float(cost_info.get("query_cost", 0.0))
 
                 if total_cost > max_cost_mysql:
-                    raise QueryCostExceededError(
+                    raise ExecutionPlanCostExceededError(
                         f"MySQL query_cost estimated at {total_cost:.1f} (limit: {max_cost_mysql:.1f})."
                     )
                 return {"dialect": "mysql", "estimated_cost": total_cost, "raw_plan": plan_data}
@@ -431,7 +450,7 @@ class DatabaseManager:
                 ]
 
                 if len(unindexed_scans) >= 3:
-                    raise QueryCostExceededError(
+                    raise ExecutionPlanCostExceededError(
                         f"SQLite planner detected {len(unindexed_scans)} unindexed table scans: {'; '.join(unindexed_scans)}"
                     )
                 return {"dialect": "sqlite", "plan_details": details, "hazards": unindexed_scans}
