@@ -8,159 +8,205 @@ from botocore.exceptions import ClientError
 
 class AthenaManager:
 
-  def __init__(
-      self, database: str, bucket_name: str, region: str = "us-east-1"
-  ):
-    self.database = database
-    self.bucket_name = bucket_name
-    self.region = region
-    self.output_location = f"s3://{bucket_name}/athena-results/"
+    def __init__(
+        self,
+        database: str,
+        bucket_name: str,
+        region: str = "us-east-1",
+        work_group: str = "primary",
+        max_scan_mb: int = 500,
+        query_timeout_sec: int = 30,
+    ):
+        self.database = database
+        self.bucket_name = bucket_name
+        self.region = region
+        self.work_group = work_group
+        self.max_scan_bytes = max_scan_mb * 1024 * 1024
+        self.query_timeout_sec = query_timeout_sec
+        self.output_location = f"s3://{bucket_name}/athena-results/"
 
-    self.athena = boto3.client("athena", region_name=region)
-    self.s3 = boto3.client("s3", region_name=region)
-    self.glue = boto3.client("glue", region_name=region)
-    self.dialect = "athena"
+        self.athena = boto3.client("athena", region_name=region)
+        self.s3 = boto3.client("s3", region_name=region)
+        self.glue = boto3.client("glue", region_name=region)
+        self.dialect = "athena"
 
-  def execute_query(
-      self, sql: str, check_cost: bool = False, *args, **kwargs
-  ) -> tuple[pd.DataFrame, str]:
-    """Executes SQL in Athena.
+        # Configure AWS-native per-query data scan cutoff on the Athena Workgroup
+        self._enforce_workgroup_guardrails()
 
-    Handles DDL (CREATE/DROP) and DML (SELECT) properly without NoSuchKey
-    errors. Returns (df, query_plan) for full compatibility with agent.py.
-    """
-    sql_clean = sql.strip().rstrip(";")
-    is_ddl_query = sql_clean.upper().startswith((
-        "CREATE",
-        "DROP",
-        "ALTER",
-        "MSCK",
-        "SHOW",
-        "DESCRIBE",
-    ))
+    def _enforce_workgroup_guardrails(self) -> None:
+        """
+        Configures BytesScannedCutoffPerQuery on the target Athena Workgroup
+        to prevent runaway query scan costs at the AWS infrastructure layer.
+        Fails gracefully if the IAM role lacks athena:UpdateWorkGroup permissions.
+        """
+        try:
+            self.athena.update_work_group(
+                WorkGroup=self.work_group,
+                ConfigurationUpdates={
+                    "EnforceWorkGroupConfiguration": False,
+                    "BytesScannedCutoffPerQuery": self.max_scan_bytes,
+                },
+            )
+        except Exception:
+            # Non-blocking if running under a least-privilege IAM role without UpdateWorkGroup
+            pass
 
-    response = self.athena.start_query_execution(
-        QueryString=sql_clean,
-        QueryExecutionContext={"Database": self.database},
-        ResultConfiguration={"OutputLocation": self.output_location},
-    )
-    query_execution_id = response["QueryExecutionId"]
+    def execute_query(
+        self, sql: str, check_cost: bool = False, *args, **kwargs
+    ) -> tuple[pd.DataFrame, str]:
+        """Executes SQL in Athena within Workgroup scan and timeout limits.
 
-    # Poll execution status until completion
-    while True:
-      status_resp = self.athena.get_query_execution(
-          QueryExecutionId=query_execution_id
-      )
-      query_info = status_resp.get("QueryExecution", {})
-      state = query_info.get("Status", {}).get("State")
+        Handles DDL (CREATE/DROP) and DML (SELECT) properly without NoSuchKey
+        errors. Returns (df, query_plan) for full compatibility with agent.py.
+        """
+        sql_clean = sql.strip().rstrip(";")
+        is_ddl_query = sql_clean.upper().startswith((
+            "CREATE",
+            "DROP",
+            "ALTER",
+            "MSCK",
+            "SHOW",
+            "DESCRIBE",
+        ))
 
-      if state == "SUCCEEDED":
-        break
-      elif state in ["FAILED", "CANCELLED"]:
-        reason = query_info.get("Status", {}).get(
-            "StateChangeReason", "Unknown error"
+        response = self.athena.start_query_execution(
+            QueryString=sql_clean,
+            QueryExecutionContext={"Database": self.database},
+            ResultConfiguration={"OutputLocation": self.output_location},
+            WorkGroup=self.work_group,
         )
-        raise RuntimeError(f"Athena Query {state}: {reason}")
-      time.sleep(0.5)
+        query_execution_id = response["QueryExecutionId"]
+        start_time = time.time()
 
-    # 1. If it was a DDL statement, Athena does not produce a CSV result
-    statement_type = query_info.get("StatementType", "")
-    if is_ddl_query or statement_type == "DDL":
-      return pd.DataFrame(), f"Athena DDL Executed: {query_execution_id}"
+        # Poll execution status until completion or timeout
+        while True:
+            if (time.time() - start_time) > self.query_timeout_sec:
+                try:
+                    self.athena.stop_query_execution(QueryExecutionId=query_execution_id)
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    f"Athena query exceeded timeout limit of {self.query_timeout_sec}s and was cancelled."
+                )
 
-    # 2. Extract the actual output location staged by Athena
-    output_location = query_info.get("ResultConfiguration", {}).get(
-        "OutputLocation", ""
-    )
-    if not output_location.endswith(".csv"):
-      return pd.DataFrame(), f"Athena Execution ID: {query_execution_id}"
+            status_resp = self.athena.get_query_execution(
+                QueryExecutionId=query_execution_id
+            )
+            query_info = status_resp.get("QueryExecution", {})
+            state = query_info.get("Status", {}).get("State")
 
-    # Parse bucket and key from output_location (e.g. s3://bucket/athena-results/xyz.csv)
-    s3_path = output_location.replace("s3://", "")
-    target_bucket, result_key = s3_path.split("/", 1)
+            if state == "SUCCEEDED":
+                break
+            elif state in ["FAILED", "CANCELLED"]:
+                reason = query_info.get("Status", {}).get(
+                    "StateChangeReason", "Unknown error"
+                )
+                raise RuntimeError(f"Athena Query {state}: {reason}")
+            time.sleep(0.5)
 
-    try:
-      obj = self.s3.get_object(Bucket=target_bucket, Key=result_key)
-      df = pd.read_csv(obj["Body"])
-    except (ClientError, pd.errors.EmptyDataError):
-      df = pd.DataFrame()
+        # 1. If it was a DDL statement, Athena does not produce a CSV result
+        statement_type = query_info.get("StatementType", "")
+        if is_ddl_query or statement_type == "DDL":
+            return pd.DataFrame(), f"Athena DDL Executed: {query_execution_id}"
 
-    plan_summary = f"Athena Execution ID: {query_execution_id}"
-    return df, plan_summary
+        # 2. Extract the actual output location staged by Athena
+        output_location = query_info.get("ResultConfiguration", {}).get(
+            "OutputLocation", ""
+        )
+        if not output_location.endswith(".csv"):
+            return pd.DataFrame(), f"Athena Execution ID: {query_execution_id}"
 
-  def get_schema(self) -> str:
-    """Retrieves table and column metadata from the Glue Catalog for prompting."""
-    tables_resp = self.glue.get_tables(DatabaseName=self.database)
-    schema_lines = []
+        # Parse bucket and key from output_location (e.g. s3://bucket/athena-results/xyz.csv)
+        s3_path = output_location.replace("s3://", "")
+        target_bucket, result_key = s3_path.split("/", 1)
 
-    for tbl in tables_resp.get("TableList", []):
-      tbl_name = tbl["Name"]
-      cols = [
-          f"{c['Name']} {c['Type']}"
-          for c in tbl.get("StorageDescriptor", {}).get("Columns", [])
-      ]
-      schema_lines.append(
-          f"CREATE EXTERNAL TABLE {tbl_name} (\n  "
-          + ",\n  ".join(cols)
-          + "\n);"
-      )
+        try:
+            obj = self.s3.get_object(Bucket=target_bucket, Key=result_key)
+            df = pd.read_csv(obj["Body"])
+        except (ClientError, pd.errors.EmptyDataError):
+            df = pd.DataFrame()
 
-    return (
-        "\n\n".join(schema_lines)
-        if schema_lines
-        else "-- No tables found in database."
-    )
+        bytes_scanned = (
+            query_info.get("Statistics", {}).get("DataScannedInBytes", 0)
+        )
+        plan_summary = (
+            f"Athena Execution ID: {query_execution_id} "
+            f"(Data Scanned: {bytes_scanned / (1024 * 1024):.2f} MB)"
+        )
+        return df, plan_summary
 
-  def stream_upload_and_create_table(self, uploaded_file) -> str:
-    """Streams CSV, TSV, XLSX, XLS, and PARQUET to S3 and registers external
+    def get_schema(self) -> str:
+        """Retrieves table and column metadata from the Glue Catalog for prompting."""
+        tables_resp = self.glue.get_tables(DatabaseName=self.database)
+        schema_lines = []
 
-    tables in Glue.
-    """
-    fname = uploaded_file.name
-    tbl_name = re.sub(r"[^a-zA-Z0-9_]", "_", fname.rsplit(".", 1)[0].lower())
-    s3_prefix = f"data/{tbl_name}/"
+        for tbl in tables_resp.get("TableList", []):
+            tbl_name = tbl["Name"]
+            cols = [
+                f"{c['Name']} {c['Type']}"
+                for c in tbl.get("StorageDescriptor", {}).get("Columns", [])
+            ]
+            schema_lines.append(
+                f"CREATE EXTERNAL TABLE {tbl_name} (\n  "
+                + ",\n  ".join(cols)
+                + "\n);"
+            )
 
-    # Read bytes safely in memory to prevent closed file stream exceptions
-    file_bytes = uploaded_file.getvalue()
+        return (
+            "\n\n".join(schema_lines)
+            if schema_lines
+            else "-- No tables found in database."
+        )
 
-    type_map = {
-        "int64": "BIGINT",
-        "int32": "INT",
-        "float64": "DOUBLE",
-        "float32": "FLOAT",
-        "bool": "BOOLEAN",
-        "datetime64[ns]": "TIMESTAMP",
-    }
+    def stream_upload_and_create_table(self, uploaded_file) -> str:
+        """Streams CSV, TSV, XLSX, XLS, and PARQUET to S3 and registers external
+        tables in Glue.
+        """
+        fname = uploaded_file.name
+        tbl_name = re.sub(r"[^a-zA-Z0-9_]", "_", fname.rsplit(".", 1)[0].lower())
+        s3_prefix = f"data/{tbl_name}/"
 
-    # Format handling & DDL schema construction
-    if fname.endswith((".csv", ".tsv")):
-      delimiter = "\t" if fname.endswith(".tsv") else ","
-      sample_df = pd.read_csv(
-          io.BytesIO(file_bytes), sep=delimiter, nrows=100
-      )
+        # Read bytes safely in memory to prevent closed file stream exceptions
+        file_bytes = uploaded_file.getvalue()
 
-      # Upload raw file directly into its dedicated S3 table prefix
-      s3_key = f"{s3_prefix}{fname}"
-      self.s3.upload_fileobj(
-          io.BytesIO(file_bytes), self.bucket_name, s3_key
-      )
+        type_map = {
+            "int64": "BIGINT",
+            "int32": "INT",
+            "float64": "DOUBLE",
+            "float32": "FLOAT",
+            "bool": "BOOLEAN",
+            "datetime64[ns]": "TIMESTAMP",
+        }
 
-      col_defs = []
-      for col, dtype in sample_df.dtypes.items():
-        clean_col = re.sub(r"[^a-zA-Z0-9_]", "_", str(col).strip().lower())
-        if not clean_col or clean_col[0].isdigit():
-          clean_col = f"col_{clean_col}"
+        # Format handling & DDL schema construction
+        if fname.endswith((".csv", ".tsv")):
+            delimiter = "\t" if fname.endswith(".tsv") else ","
+            sample_df = pd.read_csv(
+                io.BytesIO(file_bytes), sep=delimiter, nrows=100
+            )
 
-        # If column contains only nulls, default to STRING
-        if str(dtype) == "float64" and sample_df[col].isna().all():
-          athena_type = "STRING"
-        else:
-          athena_type = type_map.get(str(dtype), "STRING")
+            # Upload raw file directly into its dedicated S3 table prefix
+            s3_key = f"{s3_prefix}{fname}"
+            self.s3.upload_fileobj(
+                io.BytesIO(file_bytes), self.bucket_name, s3_key
+            )
 
-        col_defs.append(f"`{clean_col}` {athena_type}")
+            col_defs = []
+            for col, dtype in sample_df.dtypes.items():
+                clean_col = re.sub(r"[^a-zA-Z0-9_]", "_", str(col).strip().lower())
+                if not clean_col or clean_col[0].isdigit():
+                    clean_col = f"col_{clean_col}"
 
-      term_char = "\\t" if delimiter == "\t" else ","
-      create_sql = f"""
+                # If column contains only nulls, default to STRING
+                if str(dtype) == "float64" and sample_df[col].isna().all():
+                    athena_type = "STRING"
+                else:
+                    athena_type = type_map.get(str(dtype), "STRING")
+
+                col_defs.append(f"`{clean_col}` {athena_type}")
+
+            term_char = "\\t" if delimiter == "\t" else ","
+            create_sql = f"""
             CREATE EXTERNAL TABLE IF NOT EXISTS {self.database}.{tbl_name} (
                 {', '.join(col_defs)}
             )
@@ -171,33 +217,33 @@ class AthenaManager:
             TBLPROPERTIES ('skip.header.line.count'='1');
             """
 
-    elif fname.endswith((".xlsx", ".xls")):
-      excel_df = pd.read_excel(io.BytesIO(file_bytes))
-      csv_buffer = io.BytesIO()
-      excel_df.to_csv(csv_buffer, index=False)
-      csv_bytes = csv_buffer.getvalue()
+        elif fname.endswith((".xlsx", ".xls")):
+            excel_df = pd.read_excel(io.BytesIO(file_bytes))
+            csv_buffer = io.BytesIO()
+            excel_df.to_csv(csv_buffer, index=False)
+            csv_bytes = csv_buffer.getvalue()
 
-      # Upload converted CSV to S3
-      s3_key = f"{s3_prefix}{tbl_name}.csv"
-      self.s3.upload_fileobj(
-          io.BytesIO(csv_bytes), self.bucket_name, s3_key
-      )
+            # Upload converted CSV to S3
+            s3_key = f"{s3_prefix}{tbl_name}.csv"
+            self.s3.upload_fileobj(
+                io.BytesIO(csv_bytes), self.bucket_name, s3_key
+            )
 
-      sample_df = excel_df.head(100)
-      col_defs = []
-      for col, dtype in sample_df.dtypes.items():
-        clean_col = re.sub(r"[^a-zA-Z0-9_]", "_", str(col).strip().lower())
-        if not clean_col or clean_col[0].isdigit():
-          clean_col = f"col_{clean_col}"
+            sample_df = excel_df.head(100)
+            col_defs = []
+            for col, dtype in sample_df.dtypes.items():
+                clean_col = re.sub(r"[^a-zA-Z0-9_]", "_", str(col).strip().lower())
+                if not clean_col or clean_col[0].isdigit():
+                    clean_col = f"col_{clean_col}"
 
-        if str(dtype) == "float64" and sample_df[col].isna().all():
-          athena_type = "STRING"
-        else:
-          athena_type = type_map.get(str(dtype), "STRING")
+                if str(dtype) == "float64" and sample_df[col].isna().all():
+                    athena_type = "STRING"
+                else:
+                    athena_type = type_map.get(str(dtype), "STRING")
 
-        col_defs.append(f"`{clean_col}` {athena_type}")
+                col_defs.append(f"`{clean_col}` {athena_type}")
 
-      create_sql = f"""
+            create_sql = f"""
             CREATE EXTERNAL TABLE IF NOT EXISTS {self.database}.{tbl_name} (
                 {', '.join(col_defs)}
             )
@@ -208,39 +254,39 @@ class AthenaManager:
             TBLPROPERTIES ('skip.header.line.count'='1');
             """
 
-    elif fname.endswith(".parquet"):
-      s3_key = f"{s3_prefix}{fname}"
-      self.s3.upload_fileobj(
-          io.BytesIO(file_bytes), self.bucket_name, s3_key
-      )
+        elif fname.endswith(".parquet"):
+            s3_key = f"{s3_prefix}{fname}"
+            self.s3.upload_fileobj(
+                io.BytesIO(file_bytes), self.bucket_name, s3_key
+            )
 
-      sample_df = pd.read_parquet(io.BytesIO(file_bytes))
-      col_defs = []
-      for col, dtype in sample_df.dtypes.items():
-        clean_col = re.sub(r"[^a-zA-Z0-9_]", "_", str(col).strip().lower())
-        athena_type = type_map.get(str(dtype), "STRING")
-        col_defs.append(f"`{clean_col}` {athena_type}")
+            sample_df = pd.read_parquet(io.BytesIO(file_bytes))
+            col_defs = []
+            for col, dtype in sample_df.dtypes.items():
+                clean_col = re.sub(r"[^a-zA-Z0-9_]", "_", str(col).strip().lower())
+                athena_type = type_map.get(str(dtype), "STRING")
+                col_defs.append(f"`{clean_col}` {athena_type}")
 
-      create_sql = f"""
+            create_sql = f"""
             CREATE EXTERNAL TABLE IF NOT EXISTS {self.database}.{tbl_name} (
                 {', '.join(col_defs)}
             )
             STORED AS PARQUET
             LOCATION 's3://{self.bucket_name}/{s3_prefix}';
             """
-    else:
-      raise ValueError(f"Unsupported file format: {fname}")
+        else:
+            raise ValueError(f"Unsupported file format: {fname}")
 
-    # Drop existing table if previously registered, then recreate
-    try:
-      self.execute_query(
-          f"DROP TABLE IF EXISTS {self.database}.{tbl_name}"
-      )
-    except Exception:
-      pass
+        # Drop existing table if previously registered, then recreate
+        try:
+            self.execute_query(
+                f"DROP TABLE IF EXISTS {self.database}.{tbl_name}"
+            )
+        except Exception:
+            pass
 
-    self.execute_query(create_sql)
-    return (
-        f"Dataset `{fname}` successfully ingested to S3 and registered as table"
-        f" `{tbl_name}` in Glue Catalog!"
-    )
+        self.execute_query(create_sql)
+        return (
+            f"Dataset `{fname}` successfully ingested to S3 and registered as table"
+            f" `{tbl_name}` in Glue Catalog!"
+        )
