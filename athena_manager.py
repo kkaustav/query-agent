@@ -168,7 +168,6 @@ class AthenaManager:
         if not isinstance(lock_lease_seconds, int) or lock_lease_seconds < 30:
             raise ValueError("lock_lease_seconds must be an integer >= 30.")
 
-        # Default to 'primary' so live Streamlit deployments never fail with WorkGroup not found
         resolved_wg = work_group or os.getenv("ATHENA_WORKGROUP", "primary")
         if not re.fullmatch(r"[a-zA-Z0-9._-]{1,128}", resolved_wg):
             raise ValueError(f"Invalid Athena Workgroup name: {resolved_wg!r}")
@@ -239,16 +238,7 @@ class AthenaManager:
                 AthenaManager._LOCAL_FENCING_COUNTER += 1
                 return AthenaManager._LOCAL_FENCING_COUNTER
         except ClientError as e:
-            err_code = e.response.get("Error", {}).get("Code", "")
-            if not self.strict_workgroup_check and err_code == "ResourceNotFoundException":
-                with self._REGISTRY_LOCK:
-                    AthenaManager._LOCAL_FENCING_COUNTER += 1
-                    return AthenaManager._LOCAL_FENCING_COUNTER
             raise AthenaExecutionError(f"Fail-Closed Error: Could not generate atomic fencing token: {e}") from e
-
-    # -------------------------------------------------------------------------
-    # Distributed Concurrency Locking & Durable State Persistence
-    # -------------------------------------------------------------------------
 
     def _state_manifest_s3_key(self, table_name: str, ingestion_id: str) -> str:
         return f"_ingestion_state/{self.database}/{table_name}/{ingestion_id}.json"
@@ -636,7 +626,6 @@ class AthenaManager:
             return self.workgroup_guardrail_verified
         except ClientError as e:
             err_code = e.response.get("Error", {}).get("Code", "")
-            # If a custom workgroup was configured via env var but doesn't exist in AWS, fall back to 'primary' in non-strict mode
             if not strict and self.work_group != "primary" and err_code == "InvalidRequestException":
                 logger.warning(
                     f"Workgroup '{self.work_group}' not found in AWS; falling back to 'primary' workgroup."
@@ -1125,12 +1114,12 @@ class AthenaManager:
                 raise ValueError(f"Invalid table identifier: {table_name}")
 
             ddl_sql = f"DROP TABLE IF EXISTS {self.database}.{table_name}"
-            parsed = sqlglot.parse(ddl_sql, read="hive", error_level=sqlglot.ErrorLevel.RAISE)
+            parsed = sqlglot.parse(ddl_sql, read="trino", error_level=sqlglot.ErrorLevel.RAISE)
             if len(parsed) != 1 or not isinstance(parsed[0], exp.Drop):
                 raise PermissionError("AST verification failed for constructed DROP TABLE DDL.")
-            table_node = parsed[0].this
+            table_node = parsed[0].this if isinstance(parsed[0].this, exp.Table) else parsed[0].find(exp.Table)
             if (
-                not isinstance(table_node, exp.Table)
+                table_node is None
                 or table_node.db.lower() != self.database.lower()
                 or table_node.name.lower() != table_name.lower()
             ):
@@ -1375,7 +1364,7 @@ class AthenaManager:
         for page in paginator.paginate(DatabaseName=self.database):
             for tbl in page.get("TableList", []):
                 tbl_name = tbl["Name"]
-                if tbl_name.startswith("_staging_"):
+                if tbl_name.startswith(("staging_", "_staging_")):
                     continue
                 cols = [
                     f"{c['Name']} {c['Type']}"
@@ -1707,7 +1696,7 @@ class AthenaManager:
 
         safe_s3_filename = f"{tbl_name}{ext}"
         ingestion_id = uuid.uuid4().hex
-        staging_tbl_name = f"_staging_{tbl_name}_{ingestion_id[:8]}"
+        staging_tbl_name = f"staging_{tbl_name}_{ingestion_id[:8]}"
         s3_prefix = f"data/{tbl_name}/ingestion_id={ingestion_id}/"
         s3_location = f"s3://{self.bucket_name}/{s3_prefix}"
         s3_key = f"{s3_prefix}{safe_s3_filename}"
@@ -1746,7 +1735,6 @@ class AthenaManager:
             previous_s3_prefix = previous_snapshot.get("s3_prefix") if previous_snapshot else None
             expected_partition_keys = previous_snapshot.get("partition_keys") if previous_snapshot else None
 
-            # Phase 1: Full structural & schema validation BEFORE uploading to S3
             if ext in (".csv", ".tsv"):
                 delimiter = "\t" if ext == ".tsv" else ","
                 col_defs = self._infer_and_validate_full_csv_stream(
@@ -1822,7 +1810,6 @@ class AthenaManager:
                 field_delimiter=field_delimiter,
             )
 
-            # Phase 2: Upload to isolated S3 prefix, register & validate staging table, then cut over
             table_modified_or_dropped = False
             staging_created = False
             self._set_ingestion_state(
