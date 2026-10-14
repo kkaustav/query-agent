@@ -1,9 +1,11 @@
 import csv
+from datetime import datetime, timezone
 import io
 import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -15,6 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import sqlglot
 from sqlglot import exp
+import xlrd
 from botocore.exceptions import ClientError
 
 from database import (
@@ -57,7 +60,6 @@ ALLOWED_ATHENA_PRIMITIVE_TYPES: Set[str] = {
     "STRING", "BIGINT", "INT", "DOUBLE", "FLOAT", "BOOLEAN", "DATE", "TIMESTAMP"
 }
 
-# Compatible physical-to-override type transitions for Parquet columns
 COMPATIBLE_PARQUET_TYPE_OVERRIDES: Dict[str, Set[str]] = {
     "INT": {"INT", "BIGINT"},
     "BIGINT": {"BIGINT"},
@@ -72,6 +74,8 @@ COMPATIBLE_PARQUET_TYPE_OVERRIDES: Dict[str, Set[str]] = {
 MAX_EXCEL_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB compressed upload cap
 MAX_EXCEL_ROWS = 100_000  # Decompressed row cap to bound container RAM
 MAX_EXCEL_COLS = 200      # Decompressed column cap to bound container RAM
+
+ACTIVE_INGESTION_STATES: Set[str] = {"UPLOADING", "VALIDATING", "CUTOVER", "ACTIVE"}
 
 
 def _validate_athena_decimal_type(type_str: str) -> bool:
@@ -115,6 +119,11 @@ def configure_workgroup_for_deployment(
 
 class AthenaManager:
 
+    # Process-wide concurrency locks and ingestion state tracking across threads/sessions
+    _REGISTRY_LOCK = threading.Lock()
+    _TABLE_LOCKS: Dict[str, threading.Lock] = {}
+    _INGESTION_STATES: Dict[str, Dict[str, Any]] = {}
+
     def __init__(
         self,
         database: str,
@@ -152,7 +161,6 @@ class AthenaManager:
         self.glue = boto3.client("glue", region_name=region)
         self.dialect = "trino"
 
-        # Multipart streaming configuration (8 MB chunks) for CSV/TSV and Parquet uploads
         self.transfer_config = TransferConfig(
             multipart_threshold=8 * 1024 * 1024,
             multipart_chunksize=8 * 1024 * 1024,
@@ -160,14 +168,42 @@ class AthenaManager:
             use_threads=True,
         )
 
-        # Read-only fail-closed verification of deployment-managed Workgroup scan cutoff
         self._verify_workgroup_guardrails(strict=self.strict_workgroup_check)
+
+    @classmethod
+    def _get_table_lock(cls, table_key: str) -> threading.Lock:
+        with cls._REGISTRY_LOCK:
+            if table_key not in cls._TABLE_LOCKS:
+                cls._TABLE_LOCKS[table_key] = threading.Lock()
+            return cls._TABLE_LOCKS[table_key]
+
+    @classmethod
+    def _set_ingestion_state(
+        cls, s3_prefix: str, table_name: str, ingestion_id: str, state: str
+    ) -> None:
+        now = time.time()
+        with cls._REGISTRY_LOCK:
+            existing = cls._INGESTION_STATES.get(s3_prefix)
+            started_at = existing["started_at"] if existing else now
+            cls._INGESTION_STATES[s3_prefix] = {
+                "ingestion_id": ingestion_id,
+                "table_name": table_name,
+                "s3_prefix": s3_prefix,
+                "state": state,
+                "started_at": started_at,
+                "updated_at": now,
+            }
+
+    @classmethod
+    def get_ingestion_state(cls, s3_prefix: str) -> Optional[Dict[str, Any]]:
+        with cls._REGISTRY_LOCK:
+            info = cls._INGESTION_STATES.get(s3_prefix)
+            return dict(info) if info else None
 
     def _verify_workgroup_guardrails(self, strict: bool = True) -> bool:
         """
         Verifies via get_work_group() that the target Athena Workgroup has
-        EnforceWorkGroupConfiguration=True and a query-level BytesScannedCutoffPerQuery
-        configured at or below self.max_scan_bytes (100 MiB = 104,857,600 bytes).
+        EnforceWorkGroupConfiguration=True and BytesScannedCutoffPerQuery <= self.max_scan_bytes.
         Does not mutate AWS configuration at startup. Fails closed when strict=True.
         """
         try:
@@ -207,7 +243,6 @@ class AthenaManager:
         Determines whether an Athena query failure is a user-correctable SQL compilation
         or schema error using Athena's structured AthenaError payload first, with a
         conservative fallback when structured fields are absent.
-        Never classifies IAM, Workgroup, scan-cutoff, throttling, or system errors as SQL errors.
         """
         non_retryable_markers = (
             "ACCESS_DENIED",
@@ -242,12 +277,9 @@ class AthenaManager:
             if any(m.lower() in err_msg.lower() for m in non_retryable_markers):
                 return False
 
-            # In Athena, ErrorCategory == 2 indicates a User Error (e.g. SQL syntax/schema).
-            # ErrorCategory == 1 (System) or 3 (Other/Capacity) must never be retried by LLM.
             if error_category in (1, 3):
                 return False
 
-            # Known Athena user-permission/cutoff ErrorTypes (e.g., 1003 Permission, 1006 Cutoff/Quota)
             non_sql_user_error_types = {1003, 1004, 1006, 1007}
             if error_type in non_sql_user_error_types:
                 return False
@@ -255,7 +287,6 @@ class AthenaManager:
             if error_category == 2:
                 return True
 
-        # Conservative fallback when structured AthenaError is not populated by the API/mock
         conservative_sql_codes = (
             "SYNTAX_ERROR:",
             "COLUMN_NOT_FOUND:",
@@ -305,10 +336,6 @@ class AthenaManager:
     def execute_query(self, sql: str) -> Tuple[pd.DataFrame, str]:
         """
         Strictly read-only analytical query execution boundary for Amazon Athena.
-        1. Enforces fail-closed Workgroup verification.
-        2. Validates the SQL AST via validate_sql_query in 'trino' dialect.
-        3. Executes the validated SELECT query in Athena and retrieves results from S3,
-           raising AthenaResultRetrievalError if S3 access fails or output location is invalid.
         """
         if self.strict_workgroup_check and not self.workgroup_guardrail_verified:
             raise AthenaExecutionError(
@@ -374,6 +401,40 @@ class AthenaManager:
         )
         return df, plan_summary
 
+    def _validate_staging_table(
+        self, staging_table_name: str, col_defs: List[Tuple[str, str]]
+    ) -> None:
+        """
+        Executes a lightweight validation query against the newly registered temporary
+        Glue staging table to verify that Athena can read the underlying S3 objects
+        and parse the schema before production cutover occurs.
+        """
+        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", staging_table_name):
+            raise ValueError(f"Invalid staging table identifier: {staging_table_name}")
+        if not col_defs:
+            raise ValueError("Cannot validate staging table with empty column definitions.")
+
+        first_col = col_defs[0][0]
+        if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", first_col):
+            raise ValueError(f"Invalid column identifier in staging validation: {first_col}")
+
+        validation_sql = f"SELECT {first_col} FROM {self.database}.{staging_table_name} LIMIT 1"
+        validate_sql_query(validation_sql, dialect="trino")
+
+        try:
+            response = self.athena.start_query_execution(
+                QueryString=validation_sql,
+                QueryExecutionContext={"Database": self.database},
+                ResultConfiguration={"OutputLocation": self.output_location},
+                WorkGroup=self.work_group,
+            )
+            query_execution_id = response["QueryExecutionId"]
+            self._poll_athena_execution(query_execution_id)
+        except Exception as e:
+            raise AthenaExecutionError(
+                f"Staging table validation query failed for '{self.database}.{staging_table_name}': {e}"
+            ) from e
+
     def _build_and_validate_create_ddl(
         self,
         table_name: str,
@@ -385,8 +446,7 @@ class AthenaManager:
     ) -> str:
         """
         Constructs a CREATE EXTERNAL TABLE statement from validated identifiers and
-        verifies the complete parsed SQLGlot AST (target database/table, column definitions,
-        storage format, and S3 location) before any DDL is submitted to Athena.
+        verifies the complete parsed SQLGlot AST before any DDL is submitted to Athena.
         """
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", self.database):
             raise ValueError(f"Invalid database identifier: {self.database}")
@@ -492,8 +552,6 @@ class AthenaManager:
     ) -> str:
         """
         Privileged internal helper for schema registration during dataset ingestion.
-        Note: In multi-user production, ingestion should run under a dedicated
-        ingestion IAM service role separate from the analytical query execution role.
         """
         if operation == "drop":
             if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", self.database):
@@ -553,7 +611,7 @@ class AthenaManager:
             expected_root = f"s3://{self.bucket_name}/data/{table_name}/"
             s3_prefix = (
                 location.replace(f"s3://{self.bucket_name}/", "", 1)
-                if location.startswith(expected_root)
+                if isinstance(location, str) and location.startswith(expected_root)
                 else None
             )
             cols = [
@@ -586,9 +644,9 @@ class AthenaManager:
 
     def _verify_table_location_updated(self, table_name: str, expected_s3_location: str) -> None:
         """
-        Verifies via Glue GetTable that a newly created/replaced table points to
-        expected_s3_location. Detects if CREATE EXTERNAL TABLE IF NOT EXISTS silently
-        left an existing table's old metadata intact.
+        Fail-closed verification via Glue GetTable that the target table's
+        StorageDescriptor.Location exactly matches expected_s3_location.
+        Raises AthenaExecutionError if Location is missing, None, empty, or mismatched.
         """
         try:
             resp = self.glue.get_table(DatabaseName=self.database, Name=table_name)
@@ -602,16 +660,19 @@ class AthenaManager:
                 f"Post-cutover verification failed for '{self.database}.{table_name}': {e}"
             ) from e
 
-        if isinstance(resp, dict):
-            actual_location = (
-                resp.get("Table", {}).get("StorageDescriptor", {}).get("Location")
+        actual_location = (
+            resp.get("Table", {})
+            .get("StorageDescriptor", {})
+            .get("Location")
+            if isinstance(resp, dict)
+            else None
+        )
+        if actual_location != expected_s3_location:
+            raise AthenaExecutionError(
+                f"Cutover verification failed for '{self.database}.{table_name}': "
+                f"Glue table metadata was not replaced (expected {expected_s3_location!r}, "
+                f"found {actual_location!r})."
             )
-            if isinstance(actual_location, str) and actual_location and actual_location != expected_s3_location:
-                raise AthenaExecutionError(
-                    f"Cutover verification failed for '{self.database}.{table_name}': "
-                    f"Glue table metadata was not replaced (expected location '{expected_s3_location}', "
-                    f"found '{actual_location}')."
-                )
 
     def _delete_s3_prefix(self, s3_prefix: str) -> None:
         """
@@ -641,30 +702,71 @@ class AthenaManager:
                             f"S3 DeleteObjects reported partial deletion errors under '{s3_prefix}': {err_summary}"
                         )
 
-    def cleanup_abandoned_staging_prefixes(self, table_name: str) -> List[str]:
+    def cleanup_abandoned_staging_prefixes(
+        self, table_name: str, min_age_seconds: int = 3600
+    ) -> List[str]:
         """
-        Operational cleanup helper: removes any abandoned S3 ingestion prefixes under
-        data/<table_name>/ that do not match the currently active Glue table Location.
+        State- and age-aware cleanup of abandoned S3 ingestion prefixes:
+        1. Never deletes the currently active Glue table prefix.
+        2. Never deletes any prefix with an active in-memory ingestion state
+           (UPLOADING, VALIDATING, CUTOVER, ACTIVE).
+        3. Enforces min_age_seconds against both tracked ingestion timestamps and S3
+           object LastModified metadata so in-flight uploads cannot be raced.
         """
         snapshot = self._get_existing_table_snapshot(table_name)
         active_prefix = snapshot.get("s3_prefix") if snapshot else None
         table_root = f"data/{table_name}/"
+        now_ts = time.time()
 
-        discovered_prefixes: Set[str] = set()
+        prefix_latest_modified: Dict[str, float] = {}
         paginator = self.s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket_name, Prefix=table_root):
             for obj in page.get("Contents", []):
                 key = obj.get("Key", "")
                 match = re.match(rf"^(data/{re.escape(table_name)}/ingestion_id=[a-f0-9]+/)", key)
                 if match:
-                    discovered_prefixes.add(match.group(1))
+                    prefix = match.group(1)
+                    last_mod = obj.get("LastModified")
+                    if isinstance(last_mod, datetime):
+                        obj_ts = (
+                            last_mod.replace(tzinfo=timezone.utc).timestamp()
+                            if last_mod.tzinfo is None
+                            else last_mod.timestamp()
+                        )
+                    else:
+                        obj_ts = 0.0
+                    prefix_latest_modified[prefix] = max(prefix_latest_modified.get(prefix, 0.0), obj_ts)
 
-        removed = []
-        for prefix in sorted(discovered_prefixes):
-            if prefix != active_prefix:
-                logger.info(f"Cleaning up abandoned S3 staging prefix '{prefix}' for table '{table_name}'.")
-                self._delete_s3_prefix(prefix)
-                removed.append(prefix)
+        removed: List[str] = []
+        for prefix in sorted(prefix_latest_modified.keys()):
+            if prefix == active_prefix:
+                continue
+
+            state_info = self.get_ingestion_state(prefix)
+            if state_info:
+                if state_info.get("state") in ACTIVE_INGESTION_STATES:
+                    logger.info(
+                        f"Skipping cleanup of prefix '{prefix}' (active state={state_info.get('state')})."
+                    )
+                    continue
+                age_sec = now_ts - float(state_info.get("updated_at", now_ts))
+                if age_sec < min_age_seconds:
+                    logger.info(
+                        f"Skipping cleanup of prefix '{prefix}' (age {age_sec:.1f}s < threshold {min_age_seconds}s)."
+                    )
+                    continue
+
+            obj_mod_ts = prefix_latest_modified.get(prefix, 0.0)
+            if obj_mod_ts > 0.0 and (now_ts - obj_mod_ts) < min_age_seconds:
+                logger.info(
+                    f"Skipping cleanup of recent S3 prefix '{prefix}' based on LastModified timestamp."
+                )
+                continue
+
+            logger.info(f"Cleaning up abandoned S3 staging prefix '{prefix}' for table '{table_name}'.")
+            self._delete_s3_prefix(prefix)
+            removed.append(prefix)
+
         return removed
 
     def get_schema(self) -> str:
@@ -716,12 +818,6 @@ class AthenaManager:
         schema_overrides: Optional[Dict[str, str]],
         valid_clean_columns: List[str],
     ) -> Dict[str, str]:
-        """
-        Validates caller-supplied schema_overrides:
-        - Rejects duplicate override keys after normalization.
-        - Rejects unknown override columns not present in the dataset.
-        - Rejects invalid Athena DDL column types.
-        """
         if not schema_overrides:
             return {}
 
@@ -763,7 +859,6 @@ class AthenaManager:
         Streams through 100% of the CSV/TSV file before upload to validate:
         1. Strict UTF-8 encoding across the entire file.
         2. Consistent column count on EVERY row (including rows beyond record 1,000).
-        Uses up to the first 1,000 rows for conservative type inference.
         """
         uploaded_file.seek(0)
         text_wrapper = io.TextIOWrapper(uploaded_file, encoding="utf-8", errors="strict", newline="")
@@ -804,9 +899,6 @@ class AthenaManager:
         rows: List[List[str]],
         schema_overrides: Optional[Dict[str, str]] = None,
     ) -> List[Tuple[str, str]]:
-        """
-        Conservatively infers Athena column types from validated CSV records.
-        """
         clean_names = cls._sanitize_column_names(header)
         expected_width = len(clean_names)
 
@@ -858,10 +950,6 @@ class AthenaManager:
 
     @staticmethod
     def _map_arrow_type_to_athena(arrow_type: pa.DataType, field_name: str = "") -> str:
-        """
-        Maps supported PyArrow primitive types to Athena DDL types.
-        Explicitly rejects nested types (struct, list, map) and uint64.
-        """
         if pa.types.is_nested(arrow_type):
             raise ValueError(
                 f"Unsupported nested Parquet type '{arrow_type}' on column '{field_name}'. "
@@ -900,28 +988,119 @@ class AthenaManager:
             f"Unsupported Parquet Arrow data type '{arrow_type}' on column '{field_name}'."
         )
 
-    @staticmethod
-    def _validate_excel_workbook_dimensions(uploaded_file: Any, raw_name: str, ext: str) -> None:
+    @classmethod
+    def _validate_and_stream_excel_to_temp_csv(
+        cls,
+        uploaded_file: Any,
+        raw_name: str,
+        ext: str,
+        schema_overrides: Optional[Dict[str, str]] = None,
+    ) -> Tuple[str, List[Tuple[str, str]]]:
         """
-        Pre-validates .xlsx workbook dimensions in read-only streaming mode before
-        pd.read_excel() constructs an in-memory DataFrame.
+        Pre-validates both .xlsx (via openpyxl read_only mode) and .xls (via xlrd on_demand mode)
+        workbook dimensions BEFORE loading rows, then streams worksheet rows directly into a
+        temporary CSV file on disk to avoid holding both a full DataFrame and a full CSV buffer in RAM.
         """
-        if ext != ".xlsx":
-            return
+        uploaded_file.seek(0, io.SEEK_END)
+        file_size = uploaded_file.tell()
         uploaded_file.seek(0)
-        wb = openpyxl.load_workbook(uploaded_file, read_only=True, data_only=True)
+        if file_size > MAX_EXCEL_UPLOAD_BYTES:
+            raise ValueError(
+                f"Excel file '{raw_name}' ({file_size / (1024 * 1024):.1f} MB) exceeds the "
+                f"{MAX_EXCEL_UPLOAD_BYTES // (1024 * 1024)} MB limit for Excel ingestion. "
+                "Please convert large workbooks to CSV or Parquet for streaming upload."
+            )
+
+        fd, tmp_csv_path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        sample_rows: List[List[str]] = []
+        header: List[str] = []
+
         try:
-            sheet = wb.active
-            if sheet is None:
-                raise ValueError(f"Excel file '{raw_name}' contains no active worksheet.")
-            if (sheet.max_column or 0) > MAX_EXCEL_COLS or (sheet.max_row or 0) > MAX_EXCEL_ROWS + 1:
-                raise ValueError(
-                    f"Excel workbook '{raw_name}' metadata dimensions ({sheet.max_row} rows, "
-                    f"{sheet.max_column} columns) exceed safety limits ({MAX_EXCEL_ROWS} rows, {MAX_EXCEL_COLS} columns)."
-                )
-        finally:
-            wb.close()
-            uploaded_file.seek(0)
+            if ext == ".xlsx":
+                wb = openpyxl.load_workbook(uploaded_file, read_only=True, data_only=True)
+                try:
+                    sheet = wb.active
+                    if sheet is None:
+                        raise ValueError(f"Excel file '{raw_name}' contains no active worksheet.")
+                    if (sheet.max_column or 0) > MAX_EXCEL_COLS or (sheet.max_row or 0) > MAX_EXCEL_ROWS + 1:
+                        raise ValueError(
+                            f"Excel workbook '{raw_name}' metadata dimensions ({sheet.max_row} rows, "
+                            f"{sheet.max_column} columns) exceed safety limits ({MAX_EXCEL_ROWS} rows, {MAX_EXCEL_COLS} columns)."
+                        )
+
+                    with open(tmp_csv_path, "w", encoding="utf-8", newline="") as csv_out:
+                        writer = csv.writer(csv_out)
+                        row_count = 0
+                        for row_idx, row_vals in enumerate(sheet.iter_rows(values_only=True), start=1):
+                            str_vals = ["" if v is None else str(v) for v in row_vals]
+                            if len(str_vals) > MAX_EXCEL_COLS:
+                                raise ValueError(
+                                    f"Excel row {row_idx} in '{raw_name}' has {len(str_vals)} columns "
+                                    f"(limit: {MAX_EXCEL_COLS})."
+                                )
+                            if row_idx == 1:
+                                header = [c for c in str_vals if c != ""] if all(c == "" for c in str_vals) else str_vals
+                                if not header:
+                                    raise ValueError(f"Uploaded Excel file '{raw_name}' contains no header columns.")
+                                writer.writerow(header)
+                            else:
+                                row_count += 1
+                                if row_count > MAX_EXCEL_ROWS:
+                                    raise ValueError(
+                                        f"Excel workbook '{raw_name}' exceeds row limit of {MAX_EXCEL_ROWS} rows."
+                                    )
+                                normalized_row = str_vals[: len(header)] + [""] * max(0, len(header) - len(str_vals))
+                                writer.writerow(normalized_row)
+                                if len(sample_rows) < 1000:
+                                    sample_rows.append(normalized_row)
+                finally:
+                    wb.close()
+                    uploaded_file.seek(0)
+
+            elif ext == ".xls":
+                raw_bytes = uploaded_file.read()
+                uploaded_file.seek(0)
+                book = xlrd.open_workbook(file_contents=raw_bytes, on_demand=True)
+                try:
+                    if book.nsheets == 0:
+                        raise ValueError(f"Excel .xls file '{raw_name}' contains no worksheets.")
+                    sheet = book.sheet_by_index(0)
+                    if sheet.ncols > MAX_EXCEL_COLS or sheet.nrows > MAX_EXCEL_ROWS + 1:
+                        raise ValueError(
+                            f"Excel .xls workbook '{raw_name}' dimensions ({sheet.nrows} rows, "
+                            f"{sheet.ncols} columns) exceed safety limits ({MAX_EXCEL_ROWS} rows, {MAX_EXCEL_COLS} columns)."
+                        )
+                    if sheet.ncols == 0 or sheet.nrows == 0:
+                        raise ValueError(f"Uploaded Excel .xls file '{raw_name}' is empty.")
+
+                    with open(tmp_csv_path, "w", encoding="utf-8", newline="") as csv_out:
+                        writer = csv.writer(csv_out)
+                        header = [str(sheet.cell_value(0, c)) for c in range(sheet.ncols)]
+                        writer.writerow(header)
+                        for r_idx in range(1, sheet.nrows):
+                            if r_idx > MAX_EXCEL_ROWS:
+                                raise ValueError(
+                                    f"Excel .xls workbook '{raw_name}' exceeds row limit of {MAX_EXCEL_ROWS} rows."
+                                )
+                            row_vals = [str(sheet.cell_value(r_idx, c)) for c in range(sheet.ncols)]
+                            writer.writerow(row_vals)
+                            if len(sample_rows) < 1000:
+                                sample_rows.append(row_vals)
+                finally:
+                    book.release_resources()
+            else:
+                raise ValueError(f"Unsupported Excel extension: {ext}")
+
+            col_defs = cls._infer_conservative_csv_columns(
+                header, sample_rows, schema_overrides=schema_overrides
+            )
+            return tmp_csv_path, col_defs
+
+        except Exception:
+            if os.path.exists(tmp_csv_path):
+                os.remove(tmp_csv_path)
+            raise
 
     def stream_upload_and_create_table(
         self,
@@ -930,7 +1109,15 @@ class AthenaManager:
     ) -> str:
         """
         Ingests datasets to S3 under a unique versioned prefix (data/<table>/ingestion_id=<uuid>/)
-        and performs a validated staging-to-production table cutover in AWS Glue/Athena.
+        and performs a true staging-table validation and production cutover in AWS Glue/Athena:
+        1. Acquires a non-blocking per-table concurrency lock so concurrent uploads targeting
+           the same table cannot overwrite or delete each other's active data.
+        2. Tracks ingestion states (UPLOADING -> VALIDATING -> CUTOVER -> ACTIVE / FAILED).
+        3. Creates a temporary Glue staging table (_staging_<table>_<id>) and runs a live
+           validation query against it before modifying the production table.
+        4. Performs production cutover and fail-closed Glue location verification.
+        5. Cleans up the temporary staging table and retires the previous S3 prefix only after
+           the replacement is verified.
         """
         raw_name = os.path.basename(getattr(uploaded_file, "name", "") or "")
         if "." not in raw_name:
@@ -942,134 +1129,110 @@ class AthenaManager:
         if not tbl_name or tbl_name[0].isdigit():
             tbl_name = f"tbl_{tbl_name}" if tbl_name else "tbl_dataset"
 
+        table_lock_key = f"{self.database}.{tbl_name}"
+        table_lock = self._get_table_lock(table_lock_key)
+        if not table_lock.acquire(blocking=False):
+            raise AthenaExecutionError(
+                f"Concurrent ingestion conflict: an upload is already in progress for table '{table_lock_key}'."
+            )
+
         safe_s3_filename = f"{tbl_name}{ext}"
         ingestion_id = uuid.uuid4().hex
         staging_tbl_name = f"_staging_{tbl_name}_{ingestion_id[:8]}"
         s3_prefix = f"data/{tbl_name}/ingestion_id={ingestion_id}/"
         s3_location = f"s3://{self.bucket_name}/{s3_prefix}"
         s3_key = f"{s3_prefix}{safe_s3_filename}"
+        tmp_excel_csv_path: Optional[str] = None
 
-        logger.info(f"Starting ingestion '{ingestion_id}' for table '{tbl_name}' from file '{raw_name}'.")
-
-        previous_snapshot = self._get_existing_table_snapshot(tbl_name)
-        previous_s3_prefix = previous_snapshot.get("s3_prefix") if previous_snapshot else None
-
-        # Phase 1: Full structural & schema validation BEFORE uploading to S3
-        if ext in (".csv", ".tsv"):
-            delimiter = "\t" if ext == ".tsv" else ","
-            col_defs = self._infer_and_validate_full_csv_stream(
-                uploaded_file=uploaded_file,
-                raw_name=raw_name,
-                delimiter=delimiter,
-                schema_overrides=schema_overrides,
-            )
-            storage_format = "TEXTFILE"
-            field_delimiter = "\\t" if delimiter == "\t" else ","
-
-            self._build_and_validate_create_ddl(
-                table_name=tbl_name,
-                col_defs=col_defs,
-                storage_format=storage_format,
-                s3_location=s3_location,
-                field_delimiter=field_delimiter,
-            )
-
-        elif ext == ".parquet":
-            uploaded_file.seek(0)
-            parquet_file = pq.ParquetFile(uploaded_file)
-            arrow_schema = parquet_file.schema_arrow
-            raw_names = list(arrow_schema.names)
-            clean_names = self._sanitize_column_names(raw_names)
-
-            validated_overrides = self._normalize_and_validate_overrides(schema_overrides, clean_names)
-
-            col_defs = []
-            for field, clean_col in zip(arrow_schema, clean_names):
-                physical_athena_type = self._map_arrow_type_to_athena(field.type, field_name=field.name)
-
-                if clean_col in validated_overrides:
-                    requested_type = validated_overrides[clean_col]
-                    allowed_targets = COMPATIBLE_PARQUET_TYPE_OVERRIDES.get(
-                        physical_athena_type, {physical_athena_type}
-                    )
-                    if requested_type not in allowed_targets:
-                        raise ValueError(
-                            f"Incompatible Parquet schema override for column '{clean_col}': "
-                            f"cannot override physical Parquet type '{physical_athena_type}' ({field.type}) "
-                            f"to '{requested_type}'."
-                        )
-                    athena_type = requested_type
-                elif clean_col in CUR_COLUMN_TYPE_OVERRIDES and pa.types.is_floating(field.type):
-                    athena_type = CUR_COLUMN_TYPE_OVERRIDES[clean_col]
-                else:
-                    athena_type = physical_athena_type
-
-                col_defs.append((clean_col, athena_type))
-
-            storage_format = "PARQUET"
-            field_delimiter = ","
-
-            self._build_and_validate_create_ddl(
-                table_name=tbl_name,
-                col_defs=col_defs,
-                storage_format=storage_format,
-                s3_location=s3_location,
-                field_delimiter=field_delimiter,
-            )
-
-        elif ext in (".xlsx", ".xls"):
-            uploaded_file.seek(0, io.SEEK_END)
-            file_size = uploaded_file.tell()
-            uploaded_file.seek(0)
-            if file_size > MAX_EXCEL_UPLOAD_BYTES:
-                raise ValueError(
-                    f"Excel file '{raw_name}' ({file_size / (1024 * 1024):.1f} MB) exceeds the "
-                    f"{MAX_EXCEL_UPLOAD_BYTES // (1024 * 1024)} MB limit for in-memory Excel conversion. "
-                    "Please convert large workbooks to CSV or Parquet for streaming upload."
-                )
-
-            self._validate_excel_workbook_dimensions(uploaded_file, raw_name, ext)
-
-            excel_df = pd.read_excel(uploaded_file, dtype=str)
-            if excel_df.empty and len(excel_df.columns) == 0:
-                raise ValueError(f"Uploaded Excel file '{raw_name}' contains no columns.")
-            if len(excel_df) > MAX_EXCEL_ROWS or len(excel_df.columns) > MAX_EXCEL_COLS:
-                raise ValueError(
-                    f"Excel workbook '{raw_name}' ({len(excel_df)} rows, {len(excel_df.columns)} columns) "
-                    f"exceeds decompressed safety limits ({MAX_EXCEL_ROWS} rows, {MAX_EXCEL_COLS} columns)."
-                )
-
-            header = [str(c) for c in excel_df.columns]
-            sample_rows = excel_df.head(1000).fillna("").values.tolist()
-            col_defs = self._infer_conservative_csv_columns(header, sample_rows, schema_overrides=schema_overrides)
-            storage_format = "TEXTFILE"
-            field_delimiter = ","
-            s3_key = f"{s3_prefix}{tbl_name}.csv"
-
-            self._build_and_validate_create_ddl(
-                table_name=tbl_name,
-                col_defs=col_defs,
-                storage_format=storage_format,
-                s3_location=s3_location,
-                field_delimiter=field_delimiter,
-            )
-        else:
-            raise ValueError(f"Unsupported file format: {raw_name}")
-
-        # Phase 2: Upload to isolated S3 prefix, validate via staging table when replacing, and cut over
-        table_dropped = False
-        staging_created = False
         try:
+            logger.info(f"Starting ingestion '{ingestion_id}' for table '{tbl_name}' from file '{raw_name}'.")
+            previous_snapshot = self._get_existing_table_snapshot(tbl_name)
+            previous_s3_prefix = previous_snapshot.get("s3_prefix") if previous_snapshot else None
+
+            # Phase 1: Full structural & schema validation BEFORE uploading to S3
             if ext in (".csv", ".tsv"):
-                uploaded_file.seek(0)
-                self.s3.upload_fileobj(
-                    uploaded_file,
-                    self.bucket_name,
-                    s3_key,
-                    Config=self.transfer_config,
+                delimiter = "\t" if ext == ".tsv" else ","
+                col_defs = self._infer_and_validate_full_csv_stream(
+                    uploaded_file=uploaded_file,
+                    raw_name=raw_name,
+                    delimiter=delimiter,
+                    schema_overrides=schema_overrides,
                 )
+                storage_format = "TEXTFILE"
+                field_delimiter = "\\t" if delimiter == "\t" else ","
+
             elif ext == ".parquet":
-                if raw_names == clean_names:
+                uploaded_file.seek(0)
+                parquet_file = pq.ParquetFile(uploaded_file)
+                arrow_schema = parquet_file.schema_arrow
+                raw_names = list(arrow_schema.names)
+                clean_names = self._sanitize_column_names(raw_names)
+
+                validated_overrides = self._normalize_and_validate_overrides(schema_overrides, clean_names)
+
+                col_defs = []
+                for field, clean_col in zip(arrow_schema, clean_names):
+                    physical_athena_type = self._map_arrow_type_to_athena(field.type, field_name=field.name)
+
+                    if clean_col in validated_overrides:
+                        requested_type = validated_overrides[clean_col]
+                        allowed_targets = COMPATIBLE_PARQUET_TYPE_OVERRIDES.get(
+                            physical_athena_type, {physical_athena_type}
+                        )
+                        if requested_type not in allowed_targets:
+                            raise ValueError(
+                                f"Incompatible Parquet schema override for column '{clean_col}': "
+                                f"cannot override physical Parquet type '{physical_athena_type}' ({field.type}) "
+                                f"to '{requested_type}'."
+                            )
+                        athena_type = requested_type
+                    elif clean_col in CUR_COLUMN_TYPE_OVERRIDES and pa.types.is_floating(field.type):
+                        athena_type = CUR_COLUMN_TYPE_OVERRIDES[clean_col]
+                    else:
+                        athena_type = physical_athena_type
+
+                    col_defs.append((clean_col, athena_type))
+
+                storage_format = "PARQUET"
+                field_delimiter = ","
+
+            elif ext in (".xlsx", ".xls"):
+                tmp_excel_csv_path, col_defs = self._validate_and_stream_excel_to_temp_csv(
+                    uploaded_file=uploaded_file,
+                    raw_name=raw_name,
+                    ext=ext,
+                    schema_overrides=schema_overrides,
+                )
+                storage_format = "TEXTFILE"
+                field_delimiter = ","
+                s3_key = f"{s3_prefix}{tbl_name}.csv"
+            else:
+                raise ValueError(f"Unsupported file format: {raw_name}")
+
+            # Pre-validate both staging and production CREATE DDL ASTs before touching S3
+            self._build_and_validate_create_ddl(
+                table_name=staging_tbl_name,
+                col_defs=col_defs,
+                storage_format=storage_format,
+                s3_location=s3_location,
+                field_delimiter=field_delimiter,
+                expected_base_table=tbl_name,
+            )
+            self._build_and_validate_create_ddl(
+                table_name=tbl_name,
+                col_defs=col_defs,
+                storage_format=storage_format,
+                s3_location=s3_location,
+                field_delimiter=field_delimiter,
+            )
+
+            # Phase 2: Upload to isolated S3 prefix, register & query staging table, then cut over
+            table_dropped = False
+            staging_created = False
+            self._set_ingestion_state(s3_prefix, tbl_name, ingestion_id, "UPLOADING")
+
+            try:
+                if ext in (".csv", ".tsv"):
                     uploaded_file.seek(0)
                     self.s3.upload_fileobj(
                         uploaded_file,
@@ -1077,100 +1240,157 @@ class AthenaManager:
                         s3_key,
                         Config=self.transfer_config,
                     )
-                else:
-                    renamed_fields = [
-                        field.with_name(clean_col)
-                        for field, clean_col in zip(arrow_schema, clean_names)
-                    ]
-                    renamed_schema = pa.schema(renamed_fields)
-                    fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
-                    os.close(fd)
-                    try:
-                        with pq.ParquetWriter(tmp_path, renamed_schema) as writer:
-                            for batch in parquet_file.iter_batches(batch_size=50_000):
-                                renamed_batch = pa.RecordBatch.from_arrays(
-                                    batch.columns, schema=renamed_schema
+                elif ext == ".parquet":
+                    if raw_names == clean_names:
+                        uploaded_file.seek(0)
+                        self.s3.upload_fileobj(
+                            uploaded_file,
+                            self.bucket_name,
+                            s3_key,
+                            Config=self.transfer_config,
+                        )
+                    else:
+                        renamed_fields = [
+                            field.with_name(clean_col)
+                            for field, clean_col in zip(arrow_schema, clean_names)
+                        ]
+                        renamed_schema = pa.schema(renamed_fields)
+                        fd, tmp_path = tempfile.mkstemp(suffix=".parquet")
+                        os.close(fd)
+                        try:
+                            with pq.ParquetWriter(tmp_path, renamed_schema) as writer:
+                                for batch in parquet_file.iter_batches(batch_size=50_000):
+                                    renamed_batch = pa.RecordBatch.from_arrays(
+                                        batch.columns, schema=renamed_schema
+                                    )
+                                    writer.write_batch(renamed_batch)
+                            with open(tmp_path, "rb") as tmp_file_obj:
+                                self.s3.upload_fileobj(
+                                    tmp_file_obj,
+                                    self.bucket_name,
+                                    s3_key,
+                                    Config=self.transfer_config,
                                 )
-                                writer.write_batch(renamed_batch)
-                        with open(tmp_path, "rb") as tmp_file_obj:
-                            self.s3.upload_fileobj(
-                                tmp_file_obj,
-                                self.bucket_name,
-                                s3_key,
-                                Config=self.transfer_config,
-                            )
-                    finally:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-            elif ext in (".xlsx", ".xls"):
-                csv_buffer = io.BytesIO()
-                excel_df.to_csv(csv_buffer, index=False)
-                csv_buffer.seek(0)
-                self.s3.upload_fileobj(
-                    csv_buffer,
-                    self.bucket_name,
-                    s3_key,
-                    Config=self.transfer_config,
+                        finally:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                elif ext in (".xlsx", ".xls") and tmp_excel_csv_path:
+                    with open(tmp_excel_csv_path, "rb") as tmp_csv_obj:
+                        self.s3.upload_fileobj(
+                            tmp_csv_obj,
+                            self.bucket_name,
+                            s3_key,
+                            Config=self.transfer_config,
+                        )
+
+                # Step 2A: Register temporary staging Glue table & validate it before production cutover
+                self._set_ingestion_state(s3_prefix, tbl_name, ingestion_id, "VALIDATING")
+                self._execute_ingestion_ddl(
+                    operation="create",
+                    table_name=staging_tbl_name,
+                    col_defs=col_defs,
+                    storage_format=storage_format,
+                    s3_location=s3_location,
+                    field_delimiter=field_delimiter,
+                    expected_base_table=tbl_name,
+                )
+                staging_created = True
+
+                self._validate_staging_table(staging_tbl_name, col_defs)
+
+                # Step 2B: Controlled production cutover (only reached if staging table is valid)
+                self._set_ingestion_state(s3_prefix, tbl_name, ingestion_id, "CUTOVER")
+                if previous_snapshot is not None:
+                    self._execute_ingestion_ddl(operation="drop", table_name=tbl_name)
+                    table_dropped = True
+
+                self._execute_ingestion_ddl(
+                    operation="create",
+                    table_name=tbl_name,
+                    col_defs=col_defs,
+                    storage_format=storage_format,
+                    s3_location=s3_location,
+                    field_delimiter=field_delimiter,
                 )
 
-            # Production cutover
-            if previous_snapshot is not None:
-                self._execute_ingestion_ddl(operation="drop", table_name=tbl_name)
-                table_dropped = True
+                # Fail-closed verification that the Glue table Location points to the new S3 prefix
+                self._verify_table_location_updated(tbl_name, s3_location)
+                self._set_ingestion_state(s3_prefix, tbl_name, ingestion_id, "ACTIVE")
 
-            self._execute_ingestion_ddl(
-                operation="create",
-                table_name=tbl_name,
-                col_defs=col_defs,
-                storage_format=storage_format,
-                s3_location=s3_location,
-                field_delimiter=field_delimiter,
-            )
+            except Exception as ingestion_err:
+                self._set_ingestion_state(s3_prefix, tbl_name, ingestion_id, "FAILED")
+                logger.error(
+                    f"Ingestion '{ingestion_id}' failed for table '{tbl_name}': {ingestion_err}. "
+                    "Initiating staging cleanup & rollback."
+                )
 
-            # Verify that the Glue table metadata now points to the new S3 location
-            self._verify_table_location_updated(tbl_name, s3_location)
+                if staging_created:
+                    try:
+                        self._execute_ingestion_ddl(operation="drop", table_name=staging_tbl_name)
+                        staging_created = False
+                    except Exception as stg_drop_err:
+                        logger.warning(f"Failed to drop temporary staging table '{staging_tbl_name}': {stg_drop_err}")
 
-        except Exception as ingestion_err:
-            logger.error(
-                f"Ingestion '{ingestion_id}' failed for table '{tbl_name}': {ingestion_err}. Initiating cleanup & rollback."
-            )
-            if staging_created:
                 try:
-                    self._execute_ingestion_ddl(operation="drop", table_name=staging_tbl_name)
+                    self._delete_s3_prefix(s3_prefix)
+                except Exception as s3_cleanup_err:
+                    logger.error(f"Failed to clean up staging S3 prefix '{s3_prefix}': {s3_cleanup_err}")
+
+                # Restore previous production table if it was dropped prior to failure
+                if (
+                    table_dropped
+                    and previous_snapshot
+                    and previous_snapshot.get("col_defs")
+                    and previous_snapshot.get("s3_location")
+                ):
+                    try:
+                        self._execute_ingestion_ddl(
+                            operation="create",
+                            table_name=tbl_name,
+                            col_defs=previous_snapshot["col_defs"],
+                            storage_format=previous_snapshot["storage_format"],
+                            s3_location=previous_snapshot["s3_location"],
+                            field_delimiter=previous_snapshot["field_delimiter"],
+                        )
+                    except Exception as restore_err:
+                        crit_msg = (
+                            f"CRITICAL RECOVERY FAILURE for table '{self.database}.{tbl_name}' "
+                            f"(ingestion_id='{ingestion_id}'): replacement failed ({ingestion_err}) "
+                            f"AND rollback to previous snapshot '{previous_snapshot.get('s3_location')}' "
+                            f"failed ({restore_err})."
+                        )
+                        logger.critical(crit_msg)
+                        raise AthenaExecutionError(crit_msg) from restore_err
+
+                raise ingestion_err
+
+            finally:
+                if staging_created:
+                    try:
+                        self._execute_ingestion_ddl(operation="drop", table_name=staging_tbl_name)
+                    except Exception as stg_cleanup_err:
+                        logger.warning(
+                            f"Non-fatal: could not drop temporary staging table '{staging_tbl_name}': {stg_cleanup_err}"
+                        )
+
+            # Phase 3: Clean up retired S3 prefix ONLY after new table cutover & location verification succeed
+            if previous_s3_prefix and previous_s3_prefix != s3_prefix:
+                self._set_ingestion_state(previous_s3_prefix, tbl_name, ingestion_id, "RETIRED")
+                try:
+                    self._delete_s3_prefix(previous_s3_prefix)
+                except Exception as cleanup_err:
+                    logger.warning(f"Non-fatal: could not remove retired S3 prefix '{previous_s3_prefix}': {cleanup_err}")
+
+            logger.info(f"Completed ingestion '{ingestion_id}' for table '{tbl_name}' at '{s3_location}'.")
+            return (
+                f"Dataset `{raw_name}` successfully ingested to `{s3_location}` and registered as table"
+                f" `{tbl_name}` in Glue Catalog!"
+            )
+
+        finally:
+            if tmp_excel_csv_path and os.path.exists(tmp_excel_csv_path):
+                try:
+                    os.remove(tmp_excel_csv_path)
                 except Exception:
                     pass
-
-            # 1. Clean up newly uploaded objects in the failed S3 staging prefix
-            try:
-                self._delete_s3_prefix(s3_prefix)
-            except Exception as s3_cleanup_err:
-                logger.error(f"Failed to clean up staging S3 prefix '{s3_prefix}': {s3_cleanup_err}")
-
-            # 2. Restore previous production table if it was dropped prior to failure
-            if table_dropped and previous_snapshot and previous_snapshot.get("col_defs") and previous_snapshot.get("s3_location"):
-                try:
-                    self._execute_ingestion_ddl(
-                        operation="create",
-                        table_name=tbl_name,
-                        col_defs=previous_snapshot["col_defs"],
-                        storage_format=previous_snapshot["storage_format"],
-                        s3_location=previous_snapshot["s3_location"],
-                        field_delimiter=previous_snapshot["field_delimiter"],
-                    )
-                except Exception as restore_err:
-                    logger.error(f"Rollback of previous table '{tbl_name}' failed: {restore_err}")
-
-            raise ingestion_err
-
-        # Phase 3: Clean up retired S3 prefix ONLY after new table cutover & location verification succeed
-        if previous_s3_prefix and previous_s3_prefix != s3_prefix:
-            try:
-                self._delete_s3_prefix(previous_s3_prefix)
-            except Exception as cleanup_err:
-                logger.warning(f"Non-fatal: could not remove retired S3 prefix '{previous_s3_prefix}': {cleanup_err}")
-
-        logger.info(f"Completed ingestion '{ingestion_id}' for table '{tbl_name}' at '{s3_location}'.")
-        return (
-            f"Dataset `{raw_name}` successfully ingested to `{s3_location}` and registered as table"
-            f" `{tbl_name}` in Glue Catalog!"
-        )
+            table_lock.release()
