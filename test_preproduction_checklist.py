@@ -85,6 +85,25 @@ def _build_mock_manager(
             }
         }
     }
+    mock_athena.get_query_execution.return_value = {
+        "QueryExecution": {
+            "Status": {"State": "SUCCEEDED"},
+            "ResultConfiguration": {
+                "OutputLocation": "s3://cur-bucket/athena-results/default.csv"
+            },
+            "Statistics": {"DataScannedInBytes": 512},
+        }
+    }
+    mock_dynamodb.update_item.return_value = {
+        "Attributes": {"counter_value": {"N": "1"}}
+    }
+    mock_s3.get_object.side_effect = lambda **kwargs: {
+        "Body": io.BytesIO(
+            b"_sampled_rows,_null_chk_0,_nn_chk_0,_null_chk_1,_nn_chk_1,_num_chk_1,_nan_inf_chk_1\n"
+            b"1,0,1,0,1,10.0,0\n"
+        )
+    }
+    mock_s3.get_paginator.return_value.paginate.return_value = [{"Contents": []}]
 
     def client_factory(service_name, **kwargs):
         return {
@@ -99,6 +118,7 @@ def _build_mock_manager(
             database="finops_db",
             bucket_name="cur-bucket",
             work_group="nl-bi-finops-workgroup",
+            strict_workgroup_check=True,
             task_owner_id=task_owner_id,
             use_atomic_glue_cutover=use_atomic_glue_cutover,
             lease_heartbeat_interval_sec=lease_heartbeat_interval_sec,
@@ -201,39 +221,49 @@ def test_review4_and_review5_scenarios():
 
     # 4. Existing table + successful staged replacement
     mgr, mock_athena, mock_s3, mock_glue, mock_dyn = _build_mock_manager(use_atomic_glue_cutover=True)
-    mock_dyn.update_item.return_value = {"Attributes": {"counter_value": {"N": "1"}}}
     old_snap = {
         "Table": {
             "Name": "cur_report",
             "StorageDescriptor": {
                 "Location": "s3://cur-bucket/data/cur_report/ingestion_id=old_prefix/",
                 "InputFormat": "org.apache.hadoop.mapred.TextInputFormat",
-                "Columns": [{"Name": "line_item_product_code", "Type": "STRING"}],
+                "Columns": [
+                    {"Name": "line_item_product_code", "Type": "STRING"},
+                    {"Name": "line_item_unblended_cost", "Type": "DOUBLE"},
+                ],
                 "SerdeInfo": {"Parameters": {"field.delim": ","}},
             },
         }
     }
     prod_updated_locations = []
-    
+
     def capture_update_table(DatabaseName, TableInput, **kwargs):
         prod_updated_locations.append(TableInput["StorageDescriptor"]["Location"])
         return {}
 
     mock_glue.update_table.side_effect = capture_update_table
     mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-stg-ok"}
-    mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
     mock_glue.get_table.side_effect = lambda DatabaseName, Name: (
         old_snap
         if not prod_updated_locations
-        else {"Table": {"StorageDescriptor": {"Location": prod_updated_locations[-1]}}}
+        else {
+            "Table": {
+                "StorageDescriptor": {
+                    "Location": prod_updated_locations[-1],
+                    "Columns": [
+                        {"Name": "line_item_product_code", "Type": "STRING"},
+                        {"Name": "line_item_unblended_cost", "Type": "DOUBLE"},
+                    ],
+                }
+            }
+        }
     )
-    mock_s3.get_paginator.return_value = s3_paginator
-    mock_s3.get_object.return_value = {"Body": io.BytesIO(b"_sampled_rows,_null_chk_0,_nn_chk_0,_null_chk_1,_nn_chk_1,_num_chk_1,_nan_inf_chk_1\n1,0,1,0,1,10.0,0\n")}
 
     csv_ok = io.BytesIO(b"line_item_product_code,line_item_unblended_cost\nAmazonEC2,10.0\n")
     csv_ok.name = "cur_report.csv"
     res = mgr.stream_upload_and_create_table(csv_ok)
     assert prod_updated_locations and "ingestion_id=old_prefix" not in prod_updated_locations[-1]
+    assert prod_updated_locations[-1] in res
 
     # 5. Missing and empty Glue Location fail-closed
     mgr, _, _, mock_glue, _ = _build_mock_manager()
@@ -284,10 +314,9 @@ def test_review6_7_distributed_and_recovery_scenarios():
     except AthenaExecutionError as e:
         assert "Concurrent distributed ingestion conflict" in str(e)
 
-    # Scenario 3: Rollback succeeds at DDL level but restores wrong, missing, or empty Glue location
+    # Scenario 3: Rollback succeeds at API/DDL level but restores wrong, missing, or empty Glue location
     for bad_restored_loc in ("s3://cur-bucket/data/cur_report/ingestion_id=WRONG/", None, ""):
         mgr, mock_athena, mock_s3, mock_glue, mock_dynamo = _build_mock_manager(use_atomic_glue_cutover=True)
-        mock_dynamo.update_item.return_value = {"Attributes": {"counter_value": {"N": "1"}}}
         initial_snap = {
             "Table": {
                 "Name": "cur_report",
@@ -306,19 +335,11 @@ def test_review6_7_distributed_and_recovery_scenarios():
             }
         }
         mock_glue.get_table.side_effect = [initial_snap, post_rollback_snap]
-        
-        # 1. atomic update fails, 2. rollback atomic update ok at API level
         mock_glue.update_table.side_effect = [
-            ClientError({"Error": {"Code": "InternalError", "Message": "Prod CREATE failed"}}, "UpdateTable"),
-            {}
+            ClientError({"Error": {"Code": "InternalError", "Message": "Prod update failed"}}, "UpdateTable"),
+            {},
         ]
-        
         mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-stg-val"}
-        mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
-        mock_s3.get_object.return_value = {"Body": io.BytesIO(b"_sampled_rows,_null_chk_0,_nn_chk_0,_null_chk_1,_nn_chk_1,_num_chk_1,_nan_inf_chk_1\n1,0,1,0,1,10.0,0\n")}
-        s3_pag = MagicMock()
-        s3_pag.paginate.return_value = [{"Contents": []}]
-        mock_s3.get_paginator.return_value = s3_pag
 
         csv_rb = io.BytesIO(b"line_item_product_code\nAmazonEC2\n")
         csv_rb.name = "cur_report.csv"
@@ -329,7 +350,6 @@ def test_review6_7_distributed_and_recovery_scenarios():
             assert "CRITICAL RECOVERY FAILURE" in str(e)
             assert "Cutover verification failed" in str(e)
     print("[PASS] Rollback DDL succeeded but restored wrong/missing/empty Glue location -> caught as CRITICAL RECOVERY FAILURE.")
-
     print("[PASS] Distributed locking and rollback verification tests passed.")
 
 
@@ -338,12 +358,9 @@ def test_feedback7_final_blockers():
 
     # 1. Cleanup vs New Ingestion Race
     mgr, _, mock_s3, _, mock_dynamo = _build_mock_manager()
-    
-    # 1. Cleanup attempts to acquire CLEANUP lock on table but a new ingestion is active!
     mock_dynamo.put_item.side_effect = ClientError(
         {"Error": {"Code": "ConditionalCheckFailedException", "Message": "Lock held by active ingestion"}}, "PutItem"
     )
-    
     removed = mgr.cleanup_abandoned_staging_prefixes("cur_report", min_age_seconds=0, require_verified_state=False)
     assert len(removed) == 0
     assert mock_s3.delete_objects.call_count == 0
@@ -365,33 +382,37 @@ def test_feedback7_final_blockers():
     mgr, mock_athena, mock_s3, _, _ = _build_mock_manager()
     mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-val"}
     mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
-    
+
     try:
-        mgr._validate_staging_table("_stg", [("line_item_product_code", "STRING")])
+        mgr._validate_staging_table("staging_tbl", [("line_item_product_code", "STRING")])
         raise AssertionError("Expected AthenaExecutionError on missing OutputLocation")
     except AthenaExecutionError as e:
         assert "Missing or invalid Athena validation result location" in str(e)
-        
+
     mock_athena.get_query_execution.return_value = {
         "QueryExecution": {
             "Status": {"State": "SUCCEEDED"},
-            "ResultConfiguration": {"OutputLocation": "s3://b/k.csv"}
+            "ResultConfiguration": {"OutputLocation": "s3://b/k.csv"},
         }
     }
+    mock_s3.get_object.side_effect = None
     mock_s3.get_object.return_value = {"Body": io.BytesIO(b"")}
     try:
-        mgr._validate_staging_table("_stg", [("line_item_product_code", "STRING")])
-        raise AssertionError("Expected ValueError on empty validation CSV")
+        mgr._validate_staging_table("staging_tbl", [("line_item_product_code", "STRING")])
+        raise AssertionError("Expected AthenaExecutionError on empty validation CSV")
     except AthenaExecutionError as e:
         assert "empty or malformed validation metrics" in str(e)
     print("[PASS] 3/6: Staging validation fails closed when S3 results are missing or empty.")
 
     # 4. Null validation enforces 0 nulls for mandatory CUR fields
+    mock_s3.get_object.side_effect = None
     mock_s3.get_object.return_value = {
-        "Body": io.BytesIO(b"_sampled_rows,_null_chk_0,_nn_chk_0\n1000,1,999\n")
+        "Body": io.BytesIO(
+            b"_sampled_rows,_null_chk_0,_num_chk_0,_nan_inf_chk_0\n1000,1,500.0,0\n"
+        )
     }
     try:
-        mgr._validate_staging_table("_stg", [("line_item_unblended_cost", "DOUBLE")])
+        mgr._validate_staging_table("staging_tbl", [("line_item_unblended_cost", "DOUBLE")])
         raise AssertionError("Expected Validation Failed on mandatory CUR field with nulls")
     except AthenaExecutionError as e:
         assert "Mandatory FinOps column 'line_item_unblended_cost' contains 1 null values" in str(e)
@@ -399,26 +420,19 @@ def test_feedback7_final_blockers():
 
     # 5. Stale worker fencing using VersionId
     mgr, mock_athena, mock_s3, mock_glue, mock_dyn = _build_mock_manager(use_atomic_glue_cutover=True)
-    mock_dyn.update_item.return_value = {"Attributes": {"counter_value": {"N": "1"}}}
-    
     initial_snap = {
         "Table": {
             "Name": "cur_report",
             "VersionId": "v-111",
-            "StorageDescriptor": {"Location": "s3://old/"}
+            "StorageDescriptor": {"Location": "s3://cur-bucket/data/cur_report/ingestion_id=old/"},
         }
     }
     mock_glue.get_table.return_value = initial_snap
     mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-ok"}
-    mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
-    mock_s3.get_object.return_value = {"Body": io.BytesIO(b"_sampled_rows,_null_chk_0,_nn_chk_0\n1,0,1\n")}
-    mock_s3.get_paginator.return_value.paginate.return_value = [{"Contents": []}]
-    
-    # Simulate Worker A trying to update Glue, but Worker B already updated it, advancing the VersionId!
     mock_glue.update_table.side_effect = ClientError(
         {"Error": {"Code": "ConcurrentModificationException", "Message": "VersionId mismatch"}}, "UpdateTable"
     )
-    
+
     csv_ok = io.BytesIO(b"line_item_product_code\nAmazonEC2\n")
     csv_ok.name = "cur_report.csv"
     try:
@@ -428,28 +442,45 @@ def test_feedback7_final_blockers():
         assert "Split-Brain Fencing Guardrail: Glue update rejected due to concurrent modification" in str(e)
     print("[PASS] 5/6: Atomic cutover natively fences out stale workers using Glue VersionId.")
 
-    # 6. Previous S3 prefix is RETIRED, not deleted
+    # 6. Previous S3 prefix is RETIRED, not deleted immediately
     mgr, mock_athena, mock_s3, mock_glue, mock_dyn = _build_mock_manager(use_atomic_glue_cutover=True)
-    mock_dyn.update_item.return_value = {"Attributes": {"counter_value": {"N": "1"}}}
-    mock_glue.get_table.side_effect = [
-        initial_snap,
-        {"Table": {"StorageDescriptor": {"Location": "s3://cur-bucket/data/cur_report/ingestion_id=NEW/"}}}
-    ]
-    mock_glue.update_table.side_effect = None
+    snap_with_cols = {
+        "Table": {
+            "Name": "cur_report",
+            "VersionId": "v-111",
+            "StorageDescriptor": {
+                "Location": "s3://cur-bucket/data/cur_report/ingestion_id=old/",
+                "Columns": [{"Name": "line_item_product_code", "Type": "STRING"}],
+            },
+        }
+    }
+    updated_locs = []
+    mock_glue.update_table.side_effect = lambda DatabaseName, TableInput, **kw: updated_locs.append(
+        TableInput["StorageDescriptor"]["Location"]
+    )
+    mock_glue.get_table.side_effect = lambda DatabaseName, Name: (
+        snap_with_cols
+        if not updated_locs
+        else {
+            "Table": {
+                "StorageDescriptor": {
+                    "Location": updated_locs[-1],
+                    "Columns": [{"Name": "line_item_product_code", "Type": "STRING"}],
+                }
+            }
+        }
+    )
     mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-ok"}
-    mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
-    mock_s3.get_object.return_value = {"Body": io.BytesIO(b"_sampled_rows,_null_chk_0,_nn_chk_0\n1,0,1\n")}
-    mock_s3.get_paginator.return_value.paginate.return_value = [{"Contents": []}]
-    
+
     with patch.object(mgr, "_delete_s3_prefix") as mock_delete_s3:
         csv_ok2 = io.BytesIO(b"line_item_product_code\nAmazonEC2\n")
         csv_ok2.name = "cur_report.csv"
         mgr.stream_upload_and_create_table(csv_ok2)
-        
-        # Verify the old prefix is NOT deleted
+
         deleted_prefixes = [call_args[0][0] for call_args in mock_delete_s3.call_args_list]
         assert "data/cur_report/ingestion_id=old/" not in deleted_prefixes
     print("[PASS] 6/6: Old production data is retained (marked RETIRED, not deleted) after successful cutover.")
+
 
 if __name__ == "__main__":
     test_sql_validation_and_forbidden_nodes()
