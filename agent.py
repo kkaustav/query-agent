@@ -6,24 +6,12 @@ import boto3
 import pandas as pd
 import yaml
 
-# Safety and helper imports matching repository architecture
-try:
-    from database import QueryCostExceededError, is_read_only_query, validate_no_select_star
-except ImportError:
-    class QueryCostExceededError(Exception):
-        pass
-
-    def is_read_only_query(sql: str, dialect: str = "trino") -> bool:
-        forbidden = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "TRUNCATE", "CREATE", "GRANT", "REVOKE"]
-        clean = re.sub(r"--.*?\n", "", sql, flags=re.MULTILINE)
-        clean = re.sub(r"/\*.*?\*/", "", clean, flags=re.DOTALL).strip().upper()
-        tokens = re.findall(r"\b[A-Z]+\b", clean)
-        return not any(verb in tokens for verb in forbidden)
-
-    def validate_no_select_star(sql: str, dialect: str = "trino") -> Tuple[bool, str]:
-        if re.search(r"^\s*SELECT\s+(\w+\.)?\*\s+FROM\b", sql, re.IGNORECASE):
-            return False, "FinOps Cost Guardrail: 'SELECT *' is blocked. Specify explicit columns."
-        return True, ""
+from database import (
+    QueryCostExceededError,
+    is_read_only_query,
+    validate_no_select_star,
+    validate_sql_query,
+)
 
 try:
     from example_store import ExampleStore
@@ -166,7 +154,7 @@ class NLQueryAgent:
             "4. Cross-Table Joins: Inspect foreign keys in the schema carefully. Always qualify columns with explicit table aliases (e.g. c.customer_id).\n"
             "5. Dialect Rules: Use DATE 'YYYY-MM-DD', DATE_ADD, DATE_DIFF, or INTERVAL arithmetic. Avoid Postgres-specific operators like '::' or 'DISTINCT ON'.\n"
             "6. Handle NULL values gracefully using COALESCE or NULLIF.\n"
-            "7. FinOps Column Projection Hygiene: NEVER use 'SELECT *'. Always project only the specific columns required to answer the question to minimize Amazon Athena data scan costs.\n"
+            "7. FinOps Column Projection Hygiene: NEVER use 'SELECT *' or 'SELECT table.*' in outer queries, CTEs, or subqueries. Always project only the specific columns required.\n"
             "8. AWS Cost & Usage Report (CUR) Semantic Rules:\n"
             "   - Filtering AWS Services (e.g., EC2, S3, RDS, ELB, CloudWatch):\n"
             "     ALWAYS filter using 'line_item_product_code' (e.g. 'AmazonEC2', 'AmazonS3', 'AmazonRDS', 'AWSELB')\n"
@@ -215,10 +203,11 @@ class NLQueryAgent:
         history: Optional[List[Dict[str, str]]] = None,
         max_retries: int = 3
     ) -> Tuple[pd.DataFrame, str, List[Dict[str, Any]], List[Dict[str, str]], Optional[str]]:
-        """Synthesizes SQL, sanitizes queries via AST, executes against Athena, and repairs errors autonomously."""
+        """Synthesizes SQL, enforces AST security/cost guardrails, executes against Athena, and repairs retryable errors."""
         schema = self.db_manager.get_schema()
         examples = self._get_examples(natural_query)
         system_prompt = self._build_system_prompt(schema, examples)
+        target_dialect = getattr(self.db_manager, "dialect", "trino")
 
         messages: List[Dict[str, Any]] = []
 
@@ -239,22 +228,17 @@ class NLQueryAgent:
             sql = clean_sql_output(raw_response)
             final_sql = sql
 
-            # 1. Deterministic AST Read-Only Sanitization Guardrail (Hard Stop on DDL/DML)
-            if not is_read_only_query(sql):
-                err_msg = "Security violation: AST query sanitizer rejected non-SELECT or destructive statement."
-                trace.append({"attempt": attempt, "status": "cost_exceeded", "error": err_msg})
-                raise PermissionError(err_msg)
-
-            # 2. FinOps Cost Guardrail & Athena Execution (Self-Healing on SELECT * or SQL errors)
             try:
-                is_cost_safe, cost_err = validate_no_select_star(sql)
-                if not is_cost_safe:
-                    raise QueryCostExceededError(cost_err)
+                # 1. Authoritative AST Validation:
+                #    - Raises PermissionError for non-SELECT / DDL / DML / multi-statement (non-retryable)
+                #    - Raises ValueError / QueryCostExceededError for SELECT * or syntax errors (retryable)
+                validate_sql_query(sql, dialect=target_dialect)
 
+                # 2. Database / Athena Execution (also enforces validate_sql_query internally)
                 exec_result = self.db_manager.execute_query(sql)
                 df = exec_result[0] if isinstance(exec_result, tuple) else exec_result
 
-                # Zero-Result Self-Healing Guardrail
+                # 3. Zero-Result Self-Healing Guardrail
                 if (df is None or df.empty) and attempt < max_retries:
                     refinement_hint = (
                         "The executed query returned 0 rows. Please verify your WHERE clause filters against the database schema:\n"
@@ -269,19 +253,25 @@ class NLQueryAgent:
 
                 trace.append({"attempt": attempt, "status": "success", "error": None})
                 break
+
+            except PermissionError as sec_err:
+                # Hard security stop: never retry destructive or multi-statement SQL
+                trace.append({"attempt": attempt, "status": "security_blocked", "error": str(sec_err)})
+                raise
+
             except Exception as e:
                 last_error = str(e)
-                status_label = "cost_guardrail_retry" if isinstance(e, QueryCostExceededError) else "error"
+                status_label = "cost_guardrail_retry" if isinstance(e, ValueError) else "error"
                 trace.append({"attempt": attempt, "status": status_label, "error": last_error})
 
                 if attempt == max_retries:
-                    raise RuntimeError(f"Execution failed after {max_retries} attempts. Last Athena error: {last_error}")
+                    raise RuntimeError(f"Execution failed after {max_retries} attempts. Last error: {last_error}") from e
 
                 messages.append({"role": "assistant", "content": [{"text": sql}]})
                 correction_prompt = (
                     f"Attempt {attempt} failed with the following error:\n{last_error}\n\n"
                     "Analyze the error trace, inspect the column names and schemas carefully, "
-                    "explicitly project only the required columns (never use SELECT *), "
+                    "explicitly project only the required columns (never use SELECT * in any query, CTE, or subquery), "
                     "and provide a corrected Presto/Trino SQL query with no conversational markdown."
                 )
                 messages.append({"role": "user", "content": [{"text": correction_prompt}]})
