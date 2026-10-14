@@ -118,7 +118,7 @@ class NLQueryAgent:
         session_kwargs = {"region_name": aws_region}
         if aws_access_key and aws_secret_key:
             session_kwargs["aws_access_key_id"] = aws_access_key
-            session_kwargs["aws_secret_access_key"] = aws_secret_access_key
+            session_kwargs["aws_secret_access_key"] = aws_secret_key
 
         session = boto3.Session(**session_kwargs)
         self.bedrock = session.client("bedrock-runtime")
