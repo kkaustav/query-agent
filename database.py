@@ -49,22 +49,18 @@ def is_read_only_query(sql: str, dialect: str = "trino") -> bool:
 
     cleaned = sql.strip().rstrip(";")
 
-    # Fast-fail multi-statement check
     if ";" in cleaned:
         return False
 
-    # Fast-fail regex check for forbidden DDL/DML keywords outside comments
     no_comments = re.sub(r"--.*?\n", "", cleaned, flags=re.MULTILINE)
     no_comments = re.sub(r"/\*.*?\*/", "", no_comments, flags=re.DOTALL).strip()
     for pattern in FORBIDDEN_KEYWORDS:
         if re.search(pattern, no_comments, re.IGNORECASE):
             return False
 
-    # Deterministic AST parsing with sqlglot
     try:
         statements = sqlglot.parse(cleaned, read=dialect)
     except Exception:
-        # Fallback to default dialect parser if Trino-specific syntax fails
         try:
             statements = sqlglot.parse(cleaned)
         except Exception:
@@ -75,11 +71,9 @@ def is_read_only_query(sql: str, dialect: str = "trino") -> bool:
 
     ast = statements[0]
 
-    # Top-level statement must be a SELECT, SetOperation (UNION/INTERSECT/EXCEPT), or CTE wrapping a SELECT
     if not isinstance(ast, (exp.Select, exp.SetOperation)):
         return False
 
-    # Walk the entire syntax tree to ensure no mutating nodes are hidden in subqueries
     if FORBIDDEN_AST_NODES and any(ast.find_all(*FORBIDDEN_AST_NODES)):
         return False
 
@@ -88,9 +82,10 @@ def is_read_only_query(sql: str, dialect: str = "trino") -> bool:
 
 def validate_no_select_star(sql: str, dialect: str = "trino") -> Tuple[bool, str]:
     """
-    FinOps AST Cost Guardrail: Blocks top-level 'SELECT *' or 'SELECT table.*'
-    to prevent expensive full-column scans in Amazon Athena, while still
-    allowing 'SELECT COUNT(*)' and 'EXISTS (SELECT *)'.
+    FinOps AST Cost Guardrail: Recursively inspects EVERY SELECT node in the AST
+    (including outer queries, CTEs, and nested subqueries) to block 'SELECT *'
+    or 'SELECT table.*' full-column scans, while preserving legitimate expressions
+    like 'COUNT(*)' and 'EXISTS (SELECT 1 / *)'.
     """
     cleaned = sql.strip().rstrip(";")
     try:
@@ -106,16 +101,22 @@ def validate_no_select_star(sql: str, dialect: str = "trino") -> Tuple[bool, str
 
     ast = statements[0]
 
-    # Inspect the outermost SELECT projections (allows COUNT(*) because Star is inside Count)
-    if isinstance(ast, exp.Select):
-        for projection in ast.expressions:
+    # Traverse every SELECT node across the entire AST (outer query, CTEs, subqueries)
+    for select_node in ast.find_all(exp.Select):
+        # Allow SELECT * inside EXISTS (...) subqueries where columns are not materialized
+        if isinstance(select_node.parent, exp.Exists):
+            continue
+
+        for projection in select_node.expressions:
+            # Note: COUNT(*) is represented as exp.Count(this=exp.Star()), so projection
+            # is exp.Count (or exp.Alias wrapping exp.Count), NOT exp.Star or exp.Column.
             if isinstance(projection, exp.Star) or (
                 isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
             ):
                 return (
                     False,
-                    "FinOps Cost Guardrail: 'SELECT *' is blocked to prevent full-column scans in Amazon Athena. "
-                    "Please explicitly project only the required columns from the schema."
+                    "FinOps Cost Guardrail: 'SELECT *' (including inside CTEs or subqueries) is blocked "
+                    "to prevent full-column scans in Amazon Athena. Please explicitly project only the required columns."
                 )
 
     return True, ""
@@ -164,7 +165,6 @@ class DatabaseManager:
                     return 1  # Abort query execution
                 return 0
 
-            # Evaluated every 1000 SQLite VM bytecode instructions
             dbapi_connection.set_progress_handler(progress_callback, 1000)
 
         @event.listens_for(self.engine, "before_cursor_execute")
@@ -213,7 +213,7 @@ class DatabaseManager:
         return "\n\n".join(schema_definitions)
 
     def validate_query(self, sql: str) -> Tuple[bool, str]:
-        """Validates query read-only status via AST and guards against multi-statement injections."""
+        """Validates query read-only status and recursive wildcard rules via AST."""
         cleaned = sql.strip().rstrip(";")
         if ";" in cleaned:
             return False, "Multi-statement execution is disallowed for security."
@@ -222,8 +222,12 @@ class DatabaseManager:
                 return False, f"Potentially destructive DDL/DML keyword detected: {pattern}"
         if not re.match(r"^\s*(SELECT|WITH)\b", cleaned, re.IGNORECASE):
             return False, "Only read-only SELECT or WITH statements are permitted."
-        if not is_read_only_query(cleaned, dialect=self.dialect if self.dialect != "sqlite" else "sqlite"):
+        target_dialect = self.dialect if self.dialect != "sqlite" else "sqlite"
+        if not is_read_only_query(cleaned, dialect=target_dialect):
             return False, "AST validation rejected non-SELECT or mutating SQL statement."
+        is_cost_safe, cost_err = validate_no_select_star(cleaned, dialect=target_dialect)
+        if not is_cost_safe:
+            return False, cost_err
         return True, ""
 
     def inspect_query_cost(
@@ -263,13 +267,11 @@ class DatabaseManager:
                 rows = conn.execute(explain_stmt).fetchall()
                 details = [row[-1] for row in rows]
 
-                # Filter exclusively for unindexed full table scans
                 unindexed_scans = [
                     d for d in details
                     if d.startswith("SCAN") and "USING INDEX" not in d and "USING COVERING INDEX" not in d
                 ]
 
-                # Guard against unindexed multi-table Cartesian products (>= 3 concurrent scans)
                 if len(unindexed_scans) >= 3:
                     raise QueryCostExceededError(
                         f"SQLite planner detected {len(unindexed_scans)} unindexed table scans: {'; '.join(unindexed_scans)}"
