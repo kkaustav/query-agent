@@ -1,21 +1,125 @@
-import time
-import re
 import json
-from typing import Tuple, Dict, Any
+import re
+import time
+from typing import Any, Dict, Tuple
 import pandas as pd
-from sqlalchemy import create_engine, inspect, text, event
+import sqlglot
+from sqlglot import exp
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
+
 class QueryCostExceededError(Exception):
-    """Raised when an EXPLAIN query plan exceeds execution safety thresholds."""
+    """Raised when a query plan or AST cost guardrail exceeds execution safety thresholds."""
     pass
+
 
 FORBIDDEN_KEYWORDS = [
     r"\bDROP\b", r"\bDELETE\b", r"\bUPDATE\b", r"\bINSERT\b",
     r"\bALTER\b", r"\bTRUNCATE\b", r"\bREPLACE\b", r"\bGRANT\b",
-    r"\bREVOKE\b", r"\bEXEC\b", r"\bCALL\b"
+    r"\bREVOKE\b", r"\bEXEC\b", r"\bCALL\b", r"\bCREATE\b"
 ]
+
+FORBIDDEN_AST_NODES = tuple(
+    node for node in (
+        getattr(exp, "Drop", None),
+        getattr(exp, "Delete", None),
+        getattr(exp, "Update", None),
+        getattr(exp, "Insert", None),
+        getattr(exp, "Alter", None),
+        getattr(exp, "Create", None),
+        getattr(exp, "Command", None),
+        getattr(exp, "Grant", None),
+        getattr(exp, "Revoke", None),
+        getattr(exp, "TruncateTable", None),
+        getattr(exp, "Merge", None),
+    )
+    if node is not None
+)
+
+
+def is_read_only_query(sql: str, dialect: str = "trino") -> bool:
+    """
+    Deterministic sqlglot AST sanitizer that guarantees only a single,
+    read-only SELECT statement (including WITH CTEs) is permitted to execute.
+    """
+    if not sql or not sql.strip():
+        return False
+
+    cleaned = sql.strip().rstrip(";")
+
+    # Fast-fail multi-statement check
+    if ";" in cleaned:
+        return False
+
+    # Fast-fail regex check for forbidden DDL/DML keywords outside comments
+    no_comments = re.sub(r"--.*?\n", "", cleaned, flags=re.MULTILINE)
+    no_comments = re.sub(r"/\*.*?\*/", "", no_comments, flags=re.DOTALL).strip()
+    for pattern in FORBIDDEN_KEYWORDS:
+        if re.search(pattern, no_comments, re.IGNORECASE):
+            return False
+
+    # Deterministic AST parsing with sqlglot
+    try:
+        statements = sqlglot.parse(cleaned, read=dialect)
+    except Exception:
+        # Fallback to default dialect parser if Trino-specific syntax fails
+        try:
+            statements = sqlglot.parse(cleaned)
+        except Exception:
+            return False
+
+    if len(statements) != 1 or statements[0] is None:
+        return False
+
+    ast = statements[0]
+
+    # Top-level statement must be a SELECT, SetOperation (UNION/INTERSECT/EXCEPT), or CTE wrapping a SELECT
+    if not isinstance(ast, (exp.Select, exp.SetOperation)):
+        return False
+
+    # Walk the entire syntax tree to ensure no mutating nodes are hidden in subqueries
+    if FORBIDDEN_AST_NODES and any(ast.find_all(*FORBIDDEN_AST_NODES)):
+        return False
+
+    return True
+
+
+def validate_no_select_star(sql: str, dialect: str = "trino") -> Tuple[bool, str]:
+    """
+    FinOps AST Cost Guardrail: Blocks top-level 'SELECT *' or 'SELECT table.*'
+    to prevent expensive full-column scans in Amazon Athena, while still
+    allowing 'SELECT COUNT(*)' and 'EXISTS (SELECT *)'.
+    """
+    cleaned = sql.strip().rstrip(";")
+    try:
+        statements = sqlglot.parse(cleaned, read=dialect)
+    except Exception:
+        try:
+            statements = sqlglot.parse(cleaned)
+        except Exception as e:
+            return False, f"SQL Syntax Error during AST cost inspection: {e}"
+
+    if len(statements) != 1 or statements[0] is None:
+        return False, "Only a single valid SQL statement is permitted."
+
+    ast = statements[0]
+
+    # Inspect the outermost SELECT projections (allows COUNT(*) because Star is inside Count)
+    if isinstance(ast, exp.Select):
+        for projection in ast.expressions:
+            if isinstance(projection, exp.Star) or (
+                isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
+            ):
+                return (
+                    False,
+                    "FinOps Cost Guardrail: 'SELECT *' is blocked to prevent full-column scans in Amazon Athena. "
+                    "Please explicitly project only the required columns from the schema."
+                )
+
+    return True, ""
+
 
 class DatabaseManager:
     def __init__(self, connection_uri: str = "sqlite:///data/ecommerce.db", timeout_sec: int = 5):
@@ -109,7 +213,7 @@ class DatabaseManager:
         return "\n\n".join(schema_definitions)
 
     def validate_query(self, sql: str) -> Tuple[bool, str]:
-        """Validates query read-only status and guards against multi-statement injections."""
+        """Validates query read-only status via AST and guards against multi-statement injections."""
         cleaned = sql.strip().rstrip(";")
         if ";" in cleaned:
             return False, "Multi-statement execution is disallowed for security."
@@ -118,6 +222,8 @@ class DatabaseManager:
                 return False, f"Potentially destructive DDL/DML keyword detected: {pattern}"
         if not re.match(r"^\s*(SELECT|WITH)\b", cleaned, re.IGNORECASE):
             return False, "Only read-only SELECT or WITH statements are permitted."
+        if not is_read_only_query(cleaned, dialect=self.dialect if self.dialect != "sqlite" else "sqlite"):
+            return False, "AST validation rejected non-SELECT or mutating SQL statement."
         return True, ""
 
     def inspect_query_cost(
