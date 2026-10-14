@@ -34,7 +34,6 @@ from database import (
 
 logger = logging.getLogger(__name__)
 
-# Authoritative schema overrides for standard AWS Cost & Usage Report (CUR) columns
 CUR_COLUMN_TYPE_OVERRIDES: Dict[str, str] = {
     "line_item_unblended_cost": "DOUBLE",
     "line_item_blended_cost": "DOUBLE",
@@ -96,7 +95,6 @@ MAX_EXCEL_COLS = 200
 
 ACTIVE_INGESTION_STATES: Set[str] = {"UPLOADING", "VALIDATING", "CUTOVER", "ACTIVE"}
 TERMINAL_INGESTION_STATES: Set[str] = {"RETIRED", "FAILED"}
-STAGING_VALIDATION_ROW_LIMIT = 1000
 
 
 def _validate_athena_decimal_type(type_str: str) -> bool:
@@ -141,7 +139,6 @@ class AthenaManager:
     _REGISTRY_LOCK = threading.Lock()
     _TABLE_LOCKS: Dict[str, threading.Lock] = {}
     _INGESTION_STATES: Dict[str, Dict[str, Any]] = {}
-    _FENCING_COUNTER: int = 0
 
     def __init__(
         self,
@@ -158,7 +155,7 @@ class AthenaManager:
         state_retention_seconds: int = 7 * 86400,
         task_owner_id: Optional[str] = None,
         use_atomic_glue_cutover: bool = False,
-        validate_full_dataset: bool = False,
+        validate_full_dataset: bool = True,  # Default to full validation for financial integrity
     ):
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", database):
             raise ValueError(f"Invalid Glue database identifier: {database}")
@@ -221,11 +218,24 @@ class AthenaManager:
                 cls._TABLE_LOCKS[table_key] = threading.Lock()
             return cls._TABLE_LOCKS[table_key]
 
-    @classmethod
-    def _next_fencing_token(cls) -> int:
-        with cls._REGISTRY_LOCK:
-            cls._FENCING_COUNTER += 1
-            return int(time.time() * 1000) * 1000 + (cls._FENCING_COUNTER % 1000)
+    def _next_fencing_token(self) -> int:
+        """
+        Generates a truly globally monotonic fencing token using a DynamoDB atomic counter.
+        Fails closed if the durable sequence generator is unavailable.
+        """
+        if self.dynamodb is None or not self.lock_table_name:
+            raise AthenaExecutionError("DynamoDB unavailable for atomic fencing token generation.")
+        try:
+            resp = self.dynamodb.update_item(
+                TableName=self.lock_table_name,
+                Key={"lock_key": {"S": "GLOBAL_FENCING_COUNTER"}},
+                UpdateExpression="ADD counter_value :inc",
+                ExpressionAttributeValues={":inc": {"N": "1"}},
+                ReturnValues="UPDATED_NEW"
+            )
+            return int(resp["Attributes"]["counter_value"]["N"])
+        except ClientError as e:
+            raise AthenaExecutionError(f"Fail-Closed Error: Could not generate atomic fencing token: {e}") from e
 
     # -------------------------------------------------------------------------
     # Distributed Concurrency Locking & Durable State Persistence
@@ -237,10 +247,8 @@ class AthenaManager:
     def _acquire_distributed_table_lock(self, table_name: str, ingestion_id: str) -> int:
         if self.dynamodb is None or not self.lock_table_name:
             raise AthenaExecutionError(
-                "Fail-Closed Distributed Lock Error: DynamoDB client or lock_table_name "
-                "is not configured. Refusing to proceed without distributed lock protection."
+                "Fail-Closed Distributed Lock Error: DynamoDB is unavailable or lock table is unset."
             )
-
         lock_key = f"{self.database}.{table_name}"
         now = int(time.time())
         expires_at = now + self.lock_lease_seconds
@@ -274,16 +282,10 @@ class AthenaManager:
             err_code = e.response.get("Error", {}).get("Code", "")
             if err_code == "ConditionalCheckFailedException":
                 raise AthenaExecutionError(
-                    f"Concurrent distributed ingestion conflict: another worker or ECS task holds "
-                    f"an active lease on table '{lock_key}'."
+                    f"Concurrent distributed ingestion conflict for '{lock_key}'."
                 ) from e
             raise AthenaExecutionError(
-                f"Fail-Closed Distributed Lock Error: Unable to acquire DynamoDB lock on table "
-                f"'{self.lock_table_name}' for '{lock_key}' (AWS Error '{err_code}'): {e}"
-            ) from e
-        except Exception as e:
-            raise AthenaExecutionError(
-                f"Fail-Closed Distributed Lock Error: Unexpected error acquiring lock for '{lock_key}': {e}"
+                f"Fail-Closed Distributed Lock Error: Cannot acquire required DynamoDB lock for '{lock_key}' ({code}): {e}"
             ) from e
 
     def _renew_distributed_table_lock(
@@ -406,10 +408,6 @@ class AthenaManager:
         lease_lost_event: Optional[threading.Event] = None,
         error_holder: Optional[List[Optional[Exception]]] = None,
     ) -> None:
-        """
-        Enforces split-brain fencing immediately prior to critical DDL/cutover operations.
-        Ensures the background heartbeat hasn't failed and synchronously re-verifies ownership.
-        """
         if lease_lost_event is not None and lease_lost_event.is_set():
             err = error_holder[0] if error_holder and error_holder[0] else RuntimeError("Lease lost in heartbeat")
             raise AthenaExecutionError(
@@ -425,9 +423,12 @@ class AthenaManager:
         )
 
     def _get_active_dynamodb_lock_info(self, table_name: str) -> Optional[Dict[str, Any]]:
-        """Queries DynamoDB for an active lock to strictly govern S3 cleanup decisions."""
+        """
+        Fail-closed strong consistent read of the DynamoDB lock to definitively
+        verify ownership status before S3 deletion races.
+        """
         if self.dynamodb is None or not self.lock_table_name:
-            raise AthenaExecutionError("Fail-Closed Cleanup Error: DynamoDB client unavailable to verify active table locks.")
+            raise AthenaExecutionError("Fail-Closed Cleanup Error: DynamoDB client unavailable.")
 
         lock_key = f"{self.database}.{table_name}"
         try:
@@ -441,21 +442,21 @@ class AthenaManager:
                 f"Fail-Closed Cleanup Error: Failed to read DynamoDB lock table for '{lock_key}': {e}"
             ) from e
 
-        item = resp.get("Item") if isinstance(resp, dict) else None
-        if not isinstance(item, dict) or not item:
+        item = resp.get("Item")
+        if not item:
             return None
 
         try:
             return {
-                "lock_key": item.get("lock_key", {}).get("S", lock_key),
-                "owner_id": item.get("owner_id", {}).get("S", ""),
-                "ingestion_id": item.get("ingestion_id", {}).get("S", ""),
-                "state": item.get("state", {}).get("S", ""),
-                "lease_expires_at": float(item.get("lease_expires_at", {}).get("N", "0")),
-                "updated_at": float(item.get("updated_at", {}).get("N", "0")),
+                "lock_key": item["lock_key"]["S"],
+                "owner_id": item["owner_id"]["S"],
+                "ingestion_id": item["ingestion_id"]["S"],
+                "state": item["state"]["S"],
+                "lease_expires_at": float(item["lease_expires_at"]["N"]),
+                "updated_at": float(item["updated_at"]["N"]),
             }
-        except Exception:
-            return None
+        except KeyError as e:
+            raise AthenaExecutionError(f"Fail-Closed Cleanup Error: Malformed DynamoDB lock record: missing {e}")
 
     def _set_ingestion_state(
         self,
@@ -465,7 +466,6 @@ class AthenaManager:
         state: str,
         fencing_token: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Persists authoritative state to S3; fails closed on error during active phases."""
         now = time.time()
         with self._REGISTRY_LOCK:
             existing = self._INGESTION_STATES.get(s3_prefix)
@@ -811,7 +811,7 @@ class AthenaManager:
         """
         Fail-Closed Multi-Column Staging Validation:
         Strictly raises an error if S3 location is missing, fetch fails, dataset is empty,
-        or any numeric check (NaN/Infinity or mismatched counts) indicates corrupt data.
+        or any numeric/null checks indicate corrupt data.
         """
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", staging_table_name):
             raise ValueError(f"Invalid staging table identifier: {staging_table_name}")
@@ -827,12 +827,18 @@ class AthenaManager:
         names: List[str] = []
         checks: List[str] = ["COUNT(1) AS _sampled_rows"]
         numeric_col_indices: List[Tuple[int, str]] = []
+        null_col_indices: List[Tuple[int, str]] = []
 
         for idx, (name, dtype) in enumerate(col_defs):
             if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", name):
                 raise ValueError(f"Invalid column identifier in staging validation: {name}")
             names.append(name)
-            checks.append(f"COUNT({name}) AS _nn_chk_{idx}")
+            
+            # Require all fields to not be completely null
+            null_alias = f"_null_chk_{idx}"
+            checks.append(f"SUM(CASE WHEN {name} IS NULL THEN 1 ELSE 0 END) AS {null_alias}")
+            null_col_indices.append((idx, name))
+
             if _is_numeric_athena_type(dtype):
                 numeric_col_indices.append((idx, name))
                 checks.append(f"SUM(CAST({name} AS DOUBLE)) AS _num_chk_{idx}")
@@ -889,27 +895,27 @@ class AthenaManager:
         for idx, col_name in numeric_col_indices:
             nan_col = f"_nan_inf_chk_{idx}"
             sum_col = f"_num_chk_{idx}"
-            nn_col = f"_nn_chk_{idx}"
 
-            if nan_col not in val_df.columns or sum_col not in val_df.columns or nn_col not in val_df.columns:
+            if nan_col not in val_df.columns or sum_col not in val_df.columns:
                 raise ValueError(f"Missing expected metric checks for column '{col_name}'.")
 
             if pd.notna(val_df[nan_col].iloc[0]) and int(float(val_df[nan_col].iloc[0])) > 0:
                 raise ValueError(f"Numeric column '{col_name}' contains NaN or Infinite values.")
 
-            nn_count = int(float(val_df[nn_col].iloc[0])) if pd.notna(val_df[nn_col].iloc[0]) else 0
-            if nn_count > 0:
-                raw_sum = val_df[sum_col].iloc[0]
-                if pd.isna(raw_sum):
-                    raise ValueError(
-                        f"Numeric aggregate on column '{col_name}' evaluated to NaN/NULL "
-                        f"despite {nn_count} non-null values."
-                    )
+            raw_sum = val_df[sum_col].iloc[0]
+            if pd.notna(raw_sum):
                 float_sum = float(raw_sum)
                 if math.isnan(float_sum) or math.isinf(float_sum):
                     raise ValueError(
                         f"Numeric aggregate on column '{col_name}' evaluated to NaN or Infinity ({raw_sum})."
                     )
+
+        for idx, col_name in null_col_indices:
+            null_col = f"_null_chk_{idx}"
+            if null_col in val_df.columns and pd.notna(val_df[null_col].iloc[0]):
+                null_count = int(float(val_df[null_col].iloc[0]))
+                if null_count == sampled_rows:
+                    raise ValueError(f"Column '{col_name}' is 100% null in the staged dataset.")
 
     def _atomic_glue_update_table(
         self,
@@ -1116,11 +1122,6 @@ class AthenaManager:
         return f"Athena Ingestion DDL ({operation.upper()}) Executed: {query_execution_id}"
 
     def _get_existing_table_snapshot(self, table_name: str) -> Optional[Dict[str, Any]]:
-        """
-        Captures the current Glue table metadata prior to replacement.
-        Returns None ONLY when Glue returns EntityNotFoundException.
-        Re-raises AccessDeniedException or any other AWS ClientError as AthenaExecutionError.
-        """
         try:
             resp = self.glue.get_table(DatabaseName=self.database, Name=table_name)
             tbl = resp.get("Table", {})
@@ -1170,11 +1171,6 @@ class AthenaManager:
         expected_col_defs: Optional[List[Tuple[str, str]]] = None,
         expected_partition_keys: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """
-        Fail-closed verification via Glue GetTable that the target table's
-        StorageDescriptor.Location matches expected_s3_location.
-        Used after both forward production cutovers AND rollback restorations.
-        """
         try:
             resp = self.glue.get_table(DatabaseName=self.database, Name=table_name)
         except ClientError as e:
@@ -1216,10 +1212,6 @@ class AthenaManager:
                 )
 
     def _delete_s3_prefix(self, s3_prefix: str) -> None:
-        """
-        Deletes all objects under a failed or retired S3 ingestion prefix and
-        inspects the S3 DeleteObjects response for partial deletion errors.
-        """
         if not s3_prefix or not s3_prefix.startswith("data/"):
             return
         paginator = self.s3.get_paginator("list_objects_v2")
@@ -1260,11 +1252,6 @@ class AthenaManager:
         table_root = f"data/{table_name}/"
         now_ts = time.time()
 
-        active_lock = self._get_active_dynamodb_lock_info(table_name)
-        locked_ingestion_id: Optional[str] = None
-        if active_lock and float(active_lock.get("lease_expires_at", 0.0)) >= now_ts:
-            locked_ingestion_id = active_lock.get("ingestion_id") or None
-
         durable_states = self._load_durable_ingestion_states(table_name, strict=require_verified_state)
 
         prefix_latest_modified: Dict[str, Optional[float]] = {}
@@ -1290,12 +1277,6 @@ class AthenaManager:
         removed: List[str] = []
         for prefix in sorted(prefix_latest_modified.keys()):
             if prefix == active_prefix:
-                continue
-
-            if locked_ingestion_id and f"ingestion_id={locked_ingestion_id}/" in prefix:
-                logger.info(
-                    f"Skipping cleanup of prefix '{prefix}' (holds active DynamoDB lock for ingestion_id='{locked_ingestion_id}')."
-                )
                 continue
 
             state_info = durable_states.get(prefix)
@@ -1326,6 +1307,16 @@ class AthenaManager:
                     )
                     continue
 
+            # FINAL AUTHORITATIVE TOCTOU CHECK: Query DynamoDB lock table immediately before S3 deletion
+            active_lock = self._get_active_dynamodb_lock_info(table_name)
+            if active_lock and float(active_lock.get("lease_expires_at", 0.0)) > time.time():
+                locked_ingestion_id = active_lock.get("ingestion_id")
+                if locked_ingestion_id and f"ingestion_id={locked_ingestion_id}/" in prefix:
+                    logger.info(
+                        f"Skipping cleanup of prefix '{prefix}' (holds active DynamoDB lock for ingestion_id='{locked_ingestion_id}')."
+                    )
+                    continue
+
             logger.info(f"Cleaning up abandoned S3 staging prefix '{prefix}' for table '{table_name}'.")
             self._delete_s3_prefix(prefix)
             removed.append(prefix)
@@ -1333,7 +1324,6 @@ class AthenaManager:
         return removed
 
     def get_schema(self) -> str:
-        """Retrieves table and column metadata across all Glue Catalog pages for prompting."""
         schema_lines = []
         paginator = self.glue.get_paginator("get_tables")
 
