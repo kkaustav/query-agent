@@ -7,6 +7,7 @@
 [![Amazon Athena](https://img.shields.io/badge/Amazon%20Athena-Serverless%20Trino-232F3E)](https://aws.amazon.com/athena/)
 [![Amazon S3](https://img.shields.io/badge/Amazon%20S3-Data%20Lake-569A31)](https://aws.amazon.com/s3/)
 [![AWS Glue](https://img.shields.io/badge/AWS%20Glue-Data%20Catalog-blue)](https://aws.amazon.com/glue/)
+[![Amazon DynamoDB](https://img.shields.io/badge/Amazon%20DynamoDB-Distributed%20Locks-4053D6)](https://aws.amazon.com/dynamodb/)
 [![FinOps Cloud Cost Intelligence](https://img.shields.io/badge/FinOps-Cloud%20Cost%20Intelligence-00C49F)](https://www.finops.org/)
 [![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -19,7 +20,7 @@
 - **Primary (Always Online):** [https://query-agent.streamlit.app/](https://query-agent.streamlit.app/)
 - **AWS Deployment (ECS Fargate + ALB):** [https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/](https://qu-ad51b077a15a4aada7d7d6906df94105.ecs.us-east-1.on.aws/) *(Note: The AWS ECS Fargate task is scaled to 0 tasks when idle to optimize cloud costs; spin up to 1 task on-demand via the AWS CLI — see [On-Demand Service Control](#on-demand-service-control-cost-optimization)).*
 
-A serverless Text-to-SQL conversational analytics application and **FinOps copilot** built on an AWS data lakehouse. Users ask questions in plain English; the application translates them into Trino/Presto SQL, grounds the model in live AWS Glue schemas and a declarative business-metric layer (`metrics.yaml`), validates every query with Abstract Syntax Tree (AST) parsing so that only a single read-only `SELECT` runs, executes it on Amazon Athena over Amazon S3, and returns the generated SQL, an exportable result table and an interactive Plotly visualization. For AWS cost questions it adds a three-tier FinOps narrative — spend & trend analysis, potential root causes, and prescriptive optimization recommendations.
+A serverless Text-to-SQL conversational analytics application and **FinOps copilot** built on an AWS data lakehouse. Users ask questions in plain English; the application translates them into Trino/Presto SQL, grounds the model in live AWS Glue schemas and a declarative business-metric layer (`metrics.yaml`), validates every query with Abstract Syntax Tree (AST) parsing so that only a single column-pruned, read-only `SELECT` runs, executes it on Amazon Athena over Amazon S3, and returns the generated SQL, an exportable result table, and an interactive Plotly visualization. For AWS cost questions it adds a three-tier FinOps narrative — spend & trend analysis, potential root causes, and prescriptive optimization recommendations.
 
 Containerized with Docker, published to **Amazon ECR**, and hosted on **Amazon ECS on AWS Fargate** with managed ALB routing and keyless IAM Task Role authentication for **Amazon Bedrock**.
 
@@ -44,9 +45,9 @@ This application is an intelligent layer over the data platform. It does **not**
 
 | Step | What happens |
 | :--- | :--- |
-| **1. Upload** | Add a CUR file or another supported dataset. |
+| **1. Upload** | Add a CUR file or another supported dataset (validated & cut over atomically). |
 | **2. Ask** | Pose a question in plain English. |
-| **3. Analyze** | The application generates, validates and runs the SQL. |
+| **3. Analyze** | The application generates, AST-validates and runs the SQL under strict scan limits. |
 | **4. Understand** | Review the result table and interactive chart. |
 | **5. Act** | Read the FinOps narrative: candidate causes to investigate and optimization actions to consider. |
 
@@ -56,9 +57,9 @@ The result is not just a chatbot reply but a **traceable analytical workflow**: 
 
 **What makes it different**
 - **Accessibility:** business users ask questions in everyday language instead of learning SQL.
-- **End-to-end workflow:** ingestion, schema grounding, query generation, validation, execution and presentation are orchestrated in one application.
+- **End-to-end workflow:** distributed ingestion locking, staging validation, schema grounding, query generation, AST validation, execution and presentation are orchestrated in one application.
 - **Decision support:** cost answers go beyond totals to suggest possible drivers and optimization actions.
-- **Governance:** generated SQL is validated as read-only, and Athena workgroup limits help control scan cost.
+- **Governance:** generated SQL is validated as read-only with `SELECT *` projection blocking, and enforced Athena workgroup limits (100 MB per query) cap scan cost.
 
 ## Who It's For
 
@@ -92,7 +93,7 @@ The platform leverages Athena's serverless query engine to isolate and analyze a
 
 ## Architecture Overview
 
-The platform decouples streaming data ingestion, semantic vector retrieval, AST query sanitation, serverless query execution, and conversational FinOps business intelligence:
+The platform decouples streaming data ingestion, distributed lock coordination, semantic vector retrieval, AST query sanitation, serverless query execution, and conversational FinOps business intelligence:
 
 ```text
 [ User Browser / Client ]
@@ -102,19 +103,21 @@ The platform decouples streaming data ingestion, semantic vector retrieval, AST 
            │
            ▼
 [ AWS ECS on AWS Fargate (Streamlit Presentation Layer) ]
-     │                              │
-     ├─► [ Amazon Bedrock ]         ├─► [ AST SQL Sanitizer (sqlglot) ]
-     │     ├─ Nova Pro 1.0          │     └─ Strict SELECT Validation
-     │     └─ Titan Embeddings v2   │
-     │                              ├─► [ Amazon Athena (Serverless Trino) ]
-     └─► [ metrics.yaml ]           │     └─ Distributed Query Engine
-           └─ Semantic Metric Store │
-                                    ├─► [ AWS Glue Data Catalog ]
-                                    │     └─ query_agent_db
-                                    │
-                                    └─► [ Amazon S3 Lakehouse ]
-                                          ├─ Raw Tables (/data/)
-                                          └─ Athena Staging (/athena-results/)
+     │                               │
+     ├─► [ Amazon Bedrock ]          ├─► [ AST SQL Sanitizer (sqlglot) ]
+     │     ├─ Nova Pro 1.0           │     ├─ Strict Read-Only SELECT Check
+     │     └─ Titan Embeddings v2    │     └─ SELECT * Projection Blocker
+     │                               │
+     ├─► [ metrics.yaml ]            ├─► [ Amazon Athena (Serverless Trino) ]
+     │     └─ Semantic Metric Store  │     └─ Enforced 100 MB Cutoff & 30s Timeout
+     │                               │
+     └─► [ Amazon DynamoDB ]         ├─► [ AWS Glue Data Catalog ]
+           └─ Distributed Ingestion  │     └─ Atomic VersionId Cutover (query_agent_db)
+              Locks & Fencing        │
+                                     └─► [ Amazon S3 Lakehouse ]
+                                           ├─ Versioned Data Prefixes (/data/)
+                                           ├─ Durable State Manifests (/_ingestion_state/)
+                                           └─ Athena Query Results (/athena-results/)
 ```
 
 ### Core Components
@@ -124,19 +127,20 @@ The platform decouples streaming data ingestion, semantic vector retrieval, AST 
 | **Presentation** | Streamlit on ECS Fargate | Chat, uploads, result tables, Plotly charts and exports. |
 | **AI reasoning** | Amazon Bedrock Nova Pro | Natural-language understanding, SQL generation and FinOps narrative. |
 | **Semantic grounding** | `metrics.yaml` + Titan Text Embeddings v2 | Metric definitions, synonyms, default filters, schema context and relevant few-shot examples. |
-| **Safety** | `sqlglot` AST validation | Allows read-only `SELECT` queries; rejects destructive or multi-statement SQL. |
-| **Query engine** | Amazon Athena (Trino) | Executes validated queries over S3 with scan and time limits. |
-| **Metadata** | AWS Glue Data Catalog | Provides table and column schemas used to ground SQL generation. |
-| **Storage** | Amazon S3 data lakehouse | Stores uploaded datasets and Athena query outputs. |
+| **Safety & Cost Control** | `sqlglot` AST validation | Allows only single read-only `SELECT` queries; blocks `SELECT *` projections and destructive or multi-statement SQL. |
+| **Query engine** | Amazon Athena (Trino) | Executes validated queries over S3 with fail-closed 100 MB scan and 30s timeout limits. |
+| **Distributed coordination** | Amazon DynamoDB (`nl_bi_finops_ingestion_locks`) | Coordinates cross-process table leases, background heartbeats and monotonic fencing tokens during ingestion and cleanup. |
+| **Metadata** | AWS Glue Data Catalog | Provides table schemas and supports atomic `UpdateTable` cutover with `VersionId` optimistic concurrency control. |
+| **Storage** | Amazon S3 data lakehouse | Stores versioned dataset prefixes, durable ingestion state manifests and Athena query outputs. |
 
 ### How a Natural-Language Request Is Processed
 
 1. **Ask** — The user enters a question in the Streamlit chat.
 2. **Ground** — The agent retrieves Glue table schemas, metric formulas, synonyms, default filters and relevant examples.
 3. **Generate** — Bedrock Nova Pro writes Trino SQL and infers joins across tables.
-4. **Sanitize** — `sqlglot` parses the query; only a single read-only `SELECT` is allowed through.
-5. **Execute** — Athena runs the query over S3 within configured scan and time limits.
-6. **Self-heal** — If a query fails, the error trace is returned to the model for up to three corrective attempts.
+4. **Sanitize** — `sqlglot` parses the query; only a single column-pruned, read-only `SELECT` is allowed through.
+5. **Execute** — Athena runs the query over S3 within enforced workgroup scan (100 MB) and timeout (30s) limits.
+6. **Self-heal** — If a query fails with a retryable SQL or projection error, the trace is returned to the model for up to three corrective attempts.
 7. **Explain** — The app returns the result table (CSV/Excel export), an interactive chart and, for cost questions, a FinOps narrative.
 
 ---
@@ -160,20 +164,21 @@ The platform decouples streaming data ingestion, semantic vector retrieval, AST 
 - Declaratively maps business formulas (e.g., `net_revenue = SUM(order_value - discount_amount)`), entity synonyms (e.g., `"Prime members"` -> `is_prime = true`), and default filter predicates (e.g., `order_status = 'delivered'`).
 - Injects ground-truth formulas directly into Bedrock Nova Pro reasoning prompts, reducing ad-hoc metric hallucinations.
 
-### 3. Serverless Lakehouse Architecture (Amazon S3 + Amazon Athena)
-- Replaces container-bound transactional databases with an analytical data lake (`s3://query-agent-lake-<account_id>/`).
-- Executes distributed SQL across tabular datasets using Amazon Athena's serverless Trino/Presto engine.
-- Supports both delimited text files (`CSV`, `TSV`) and columnar storage (`Apache Parquet` with Snappy compression).
-- Decouples DDL (`CREATE EXTERNAL TABLE`, `DROP TABLE`) and DML (`SELECT`) workflows to prevent S3 query staging collisions.
+### 3. Serverless Lakehouse & Atomic Staged Ingestion (`athena_manager.py`)
+- Executes distributed SQL across tabular datasets (`CSV`, `TSV`, `Parquet`, `XLSX`, `XLS`) using Amazon Athena's serverless Trino/Presto engine.
+- **Distributed Lease Locking & Fencing:** Uses Amazon DynamoDB (`nl_bi_finops_ingestion_locks`) with background lease heartbeats and an atomic global counter (`GLOBAL_FENCING_COUNTER`) to prevent concurrent upload or cleanup race conditions across multiple ECS tasks/processes.
+- **Full-Dataset Staging Validation:** Uploads land in isolated S3 prefixes (`data/<table>/ingestion_id=<uuid>/`) and are validated via an Athena staging table before cutover—enforcing readable rows, valid numeric aggregates (no `NaN`/`Infinity`), and a strict **0-null policy** on mandatory AWS CUR columns (`CUR_COLUMN_TYPE_OVERRIDES`).
+- **Atomic Glue Cutover & Verified Rollback:** Replaces existing tables atomically via AWS Glue `UpdateTable` with `VersionId` optimistic concurrency fencing, verifies the updated S3 location and schema, and automatically rolls back to the prior snapshot on failure.
+- **Retired Prefix Retention:** Previous production S3 prefixes are marked `RETIRED` in durable S3 manifests and retained for a 1-hour grace period (`min_age_seconds=3600`) so in-flight Athena queries never fail during table replacement.
 
 ### 4. Dual-Track Data Ingestion Strategy
-- **Ad-Hoc UI Streaming (In-Band):** Streamlit file uploader supports batch uploading up to 10+ heterogeneous datasets (CSV, TSV, XLSX, XLS, PARQUET up to 1 GB per file) utilizing memory-buffered streaming to prevent container Out-Of-Memory (OOM) crashes on 2 GB Fargate tasks.
+- **Ad-Hoc UI Streaming (In-Band):** Streamlit file uploader supports batch uploading 10+ heterogeneous datasets (CSV, TSV, XLSX, XLS, PARQUET up to 1 GB per file; 50 MB / 100k rows cap for Excel conversion) utilizing memory-buffered streaming to prevent container Out-Of-Memory (OOM) crashes on 2 GB Fargate tasks.
 - **Lakehouse Scale Ingestion (Out-Of-Band):** For multi-gigabyte or terabyte workloads exceeding container ephemeral storage (default 20 GB), files bypass the web server via S3 Multipart Uploads or AWS CLI direct-to-S3 ingestion, followed by immediate AWS Glue Catalog schema synchronization.
 
-### 5. AST Query Sanitization & Read-Only Safety (`database.py`)
+### 5. AST Query Sanitization, Projection Pruning & Read-Only Safety (`database.py`)
 - Employs Abstract Syntax Tree (AST) analysis via `sqlglot` to parse generated SQL before transmission to Athena.
-- **Strict Read-Only Enforcement:** Allows only a single read-only `SELECT` through; traverses the expression tree to verify root nodes are `Select` statements. Rejects destructive operations (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `TRUNCATE`, `GRANT`) and multi-statement SQL.
-- Mitigates SQL injection and model hallucination risks by blocking multi-statement execution and comments that bypass parser validation.
+- **Strict Read-Only Enforcement:** Allows only a single read-only `SELECT` through; traverses the expression tree to reject destructive or administrative operations (`DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `CREATE`, `TRUNCATE`, `GRANT`, `REVOKE`, `CALL`, `SET`, `USE`) and multi-statement SQL.
+- **Cost-Aware Projection Guardrail:** Blocks `SELECT *` and `SELECT table.*` projections (`ProjectionCostExceededError`), prompting the agent to select only the specific columns needed for the user's question.
 - **Benchmark result:** all destructive attempts in the 50-prompt test set were blocked.
 
 ### 6. Cross-Table Relational Join Intelligence
@@ -182,8 +187,8 @@ The platform decouples streaming data ingestion, semantic vector retrieval, AST 
 - Employs explicit Presto/Trino SQL join semantics (`LEFT JOIN`, `INNER JOIN`) to reduce `COLUMN_NOT_FOUND` runtime exceptions.
 
 ### 7. Autonomous Self-Healing Execution Loop
-- Intercepts execution failures, schema mismatches, empty-table zero-row traps, and Trino dialect errors in real time.
-- Feeds raw database exceptions and execution traces back into Nova Pro for up to 3 automated correction iterations before returning output.
+- Intercepts retryable SQL syntax errors, projection guardrail rejections (`ProjectionCostExceededError`), schema mismatches, and Trino dialect errors in real time while failing closed on non-retryable infrastructure or scan-limit errors.
+- Feeds database exceptions and execution traces back into Nova Pro for up to 3 automated correction iterations before returning output.
 - **Benchmark result:** self-healing recovered 3 of the 4 first-pass failures, lifting overall success from 92.0% to 98.0%.
 
 ### 8. Partition & Storage Layout Advisor (`index_advisor.py`)
@@ -225,6 +230,7 @@ The ECS Fargate task executes under a scoped IAM Task Role. Broad managed polici
       "Action": [
         "s3:GetObject",
         "s3:PutObject",
+        "s3:DeleteObject",
         "s3:ListBucket",
         "s3:GetBucketLocation"
       ],
@@ -240,9 +246,10 @@ The ECS Fargate task executes under a scoped IAM Task Role. Broad managed polici
         "athena:StartQueryExecution",
         "athena:GetQueryExecution",
         "athena:GetQueryResults",
-        "athena:StopQueryExecution"
+        "athena:StopQueryExecution",
+        "athena:GetWorkGroup"
       ],
-      "Resource": "arn:aws:athena:*:*:workgroup/query-agent-workgroup"
+      "Resource": "arn:aws:athena:*:*:workgroup/primary"
     },
     {
       "Sid": "GlueCatalogAccess",
@@ -253,6 +260,7 @@ The ECS Fargate task executes under a scoped IAM Task Role. Broad managed polici
         "glue:GetTable",
         "glue:GetTables",
         "glue:CreateTable",
+        "glue:UpdateTable",
         "glue:DeleteTable",
         "glue:BatchCreatePartition"
       ],
@@ -261,24 +269,45 @@ The ECS Fargate task executes under a scoped IAM Task Role. Broad managed polici
         "arn:aws:glue:*:*:database/query_agent_db",
         "arn:aws:glue:*:*:table/query_agent_db/*"
       ]
+    },
+    {
+      "Sid": "DynamoDBIngestionLockAccess",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem"
+      ],
+      "Resource": "arn:aws:dynamodb:*:*:table/nl_bi_finops_ingestion_locks"
     }
   ]
 }
 ```
 
-### 2. Athena Cost Governance & Guardrails
+### 2. Athena Cost Governance & Fail-Closed Guardrails
 - Amazon Athena charges **$5.00 per TB** of data scanned.
-- **Workgroup Per-Query Limit:** Configured with a `BytesScannedCutoffPerQuery` limit (e.g., 1 GB in development) to terminate runaway or unpartitioned full-bucket scans before execution.
-- **Query Timeout Enforcement:** Athena queries automatically cancel after 60 seconds to mitigate resource exhaustion from non-converging joins.
+- **Enforced Workgroup Per-Query Limit (100 MB):** The Athena workgroup is configured with `BytesScannedCutoffPerQuery = 104857600` (100 MB) and `EnforceWorkGroupConfiguration = true`. `AthenaManager` verifies this guardrail at startup via `GetWorkGroup` (`strict_workgroup_check=True`) and refuses to execute queries if the cutoff is missing or unverified.
+- **Query Timeout Enforcement (30s):** Athena queries automatically cancel after 30 seconds (`query_timeout_sec=30`) via `StopQueryExecution` to mitigate resource exhaustion from non-converging joins.
 
 ### 3. Scope of These Controls
 These controls reduce risk; they do not remove the need for production identity management, data permissions, audit logging and security review. The documented security model covers the application task role. Multi-user authentication (SSO), per-user and row-level data permissions, audit logs and stronger tenant isolation are on the [roadmap](#roadmap).
 
 ---
 
-## Evaluation Benchmark
+## Evaluation Benchmark & Verification Suites
 
-### 50-Prompt Benchmark
+### 1. Pre-Production & Live AWS Integration Test Suites
+The repository includes two automated verification suites:
+- **`test_preproduction_checklist.py`**: Validates 14 SQL/projection test cases and 12 forbidden DDL/DML verbs across dialects, `clean_sql_output()` malformed LLM output handling, S3 partial deletion failure handling, distributed DynamoDB lock contention, 0-null policy enforcement on mandatory CUR columns, Glue `VersionId` stale-worker fencing, and `RETIRED` prefix retention.
+- **`live_aws_integration_test.py`**: Runs against live AWS resources in `us-east-1` to verify the enforced 100 MB Athena workgroup cutoff, live DynamoDB monotonic fencing counter (`GLOBAL_FENCING_COUNTER`), multi-process OS lock contention across distinct PIDs, and end-to-end S3 + Glue + Athena staged ingestion, atomic cutover, and query execution.
+
+```bash
+python3 test_preproduction_checklist.py
+python3 live_aws_integration_test.py
+```
+
+### 2. 50-Prompt Benchmark
 The agent was evaluated on a 50-prompt benchmark spanning FinOps cloud costs, retail, music streaming, and food delivery datasets:
 
 | Metric | Result | Notes |
@@ -313,9 +342,10 @@ A credible project separates what is implemented from what is proposed.
 
 ### Implemented & Demonstrated
 - Natural-language questions translated into Trino SQL, with schema grounding and semantic metric definitions.
-- SQL validation that allows a single read-only `SELECT` statement.
-- Athena execution over S3 data, including CSV, TSV and Parquet support.
-- Self-healing retries for query errors, up to three corrective iterations.
+- SQL AST validation that allows only a single column-pruned, read-only `SELECT` statement.
+- Enforced Athena workgroup scan cutoff (100 MB) and query timeout (30s) verified fail-closed at startup.
+- Distributed DynamoDB table locking, full-dataset Athena staging validation, atomic Glue `VersionId` cutover, verified rollback recovery, and `RETIRED` S3 prefix retention.
+- Self-healing retries for retryable query errors, up to three corrective iterations.
 - Result tables, CSV/Excel export and interactive Plotly charts.
 - A FinOps narrative for cost questions: spend analysis, candidate causes and optimization recommendations.
 
@@ -392,7 +422,7 @@ The platform supports delimited text files, columnar Parquet tables, and multi-t
 CREATE EXTERNAL TABLE query_agent_db.synthetic_cur_aug_sep_2026 (
     bill_payer_account_id bigint,
     bill_billing_period_start_date string,
-    line_item_usage_account_id bigint,
+    line_item_usage_account_id string,
     line_item_usage_account_name string,
     line_item_line_item_type string,
     line_item_usage_start_date string,
@@ -408,7 +438,7 @@ CREATE EXTERNAL TABLE query_agent_db.synthetic_cur_aug_sep_2026 (
     product_instance_type string,
     pricing_term string,
     reservation_reservation_a_r_n string,
-    reservation_effective_cost string,
+    reservation_effective_cost double,
     reservation_unused_amortized_upfront_fee_for_billing_period string,
     reservation_unused_recurring_fee string,
     savings_plan_savings_plan_a_r_n string,
@@ -451,23 +481,25 @@ TBLPROPERTIES ('parquet.compression'='SNAPPY');
 ```text
 query-agent/
 ├── .streamlit/
-│   ├── config.toml           # Streamlit server flags (1 GB maxUploadSize, CORS overrides)
-│   └── secrets.toml          # Local AWS credentials & region configuration (git-ignored)
+│   ├── config.toml                     # Streamlit server flags (1 GB maxUploadSize, CORS overrides)
+│   └── secrets.toml                    # Local AWS credentials & region configuration (git-ignored)
 ├── docs/
-│   └── images/               # Architectural visuals & FinOps screenshots
-├── agent.py                  # Bedrock Converse orchestrator, FinOps advisor & self-healing loop
-├── app.py                    # Streamlit interface, batch streaming ingestion & BI visuals
-├── athena_manager.py         # S3 streaming ingestion, Glue registration & Athena executor
-├── database.py               # AST SQL sanitizer (sqlglot) & read-only enforcement
-├── example_store.py          # Dynamic few-shot vector store using Titan Embeddings v2
-├── index_advisor.py          # Partition & Storage Layout Advisor for S3 scan optimization
-├── metrics.yaml              # Declarative business metric store & semantic definitions
-├── seed_athena.py            # Automated provisioner for initial S3 data lake & Glue tables
-├── Dockerfile                # Production multi-stage build (linux/amd64)
-├── .dockerignore             # Excludes venvs, caches, and secrets from container images
-├── requirements.txt          # Python production dependencies
-├── .gitignore                # Git exclusions
-└── README.md                 # System architecture documentation & execution guide
+│   └── images/                         # Architectural visuals & FinOps screenshots
+├── agent.py                            # Bedrock Converse orchestrator, FinOps advisor & self-healing loop
+├── app.py                              # Streamlit interface, batch streaming ingestion & BI visuals
+├── athena_manager.py                   # Distributed DynamoDB locking, staged S3/Glue cutover & Athena executor
+├── database.py                         # AST SQL sanitizer (sqlglot), SELECT * blocker & read-only enforcement
+├── example_store.py                    # Dynamic few-shot vector store using Titan Embeddings v2
+├── index_advisor.py                    # Partition & Storage Layout Advisor for S3 scan optimization
+├── metrics.yaml                        # Declarative business metric store & semantic definitions
+├── seed_athena.py                      # Automated provisioner for initial S3 data lake & Glue tables
+├── test_preproduction_checklist.py     # Unit & failure-injection pre-production test suite
+├── live_aws_integration_test.py        # Live AWS multi-process lock & end-to-end integration test suite
+├── Dockerfile                          # Production multi-stage build (linux/amd64)
+├── .dockerignore                       # Excludes venvs, caches, and secrets from container images
+├── requirements.txt                    # Python production dependencies
+├── .gitignore                          # Git exclusions
+└── README.md                           # System architecture documentation & execution guide
 ```
 
 ---
@@ -477,11 +509,11 @@ query-agent/
 ### Prerequisites
 - Python 3.10+ (tested on Python 3.12)
 - AWS Account with Bedrock model access (`amazon.nova-pro-v1:0` and `amazon.titan-embed-text-v2:0`)
-- Configured AWS CLI profile with Athena, Glue, and S3 permissions
+- Configured AWS CLI profile with Athena, Glue, S3, and DynamoDB permissions
 
 ### 1. Clone & Setup Environment
 ```bash
-git clone https://github.com/kkaustav/query-agent.git
+git clone [https://github.com/kkaustav/query-agent.git](https://github.com/kkaustav/query-agent.git)
 cd query-agent
 
 python3 -m venv .venv
@@ -489,7 +521,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure AWS Access
+### 2. Configure AWS Access & Guardrails
 Set up your local credentials via AWS CLI:
 ```bash
 aws configure
@@ -501,9 +533,25 @@ AWS_SECRET_ACCESS_KEY = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 AWS_DEFAULT_REGION = "us-east-1"
 ```
 
-### 3. Provision S3 Data Lake & Launch Application
+Ensure the Athena `primary` workgroup enforces the 100 MB per-query scan limit and the DynamoDB ingestion lock table is active:
+```bash
+aws athena update-work-group \
+    --work-group primary \
+    --configuration-updates "BytesScannedCutoffPerQuery=104857600,EnforceWorkGroupConfiguration=true" \
+    --region us-east-1
+
+aws dynamodb create-table \
+    --table-name nl_bi_finops_ingestion_locks \
+    --attribute-definitions AttributeName=lock_key,AttributeType=S \
+    --key-schema AttributeName=lock_key,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST \
+    --region us-east-1
+```
+
+### 3. Provision S3 Data Lake, Run Tests & Launch Application
 ```bash
 python seed_athena.py
+python test_preproduction_checklist.py
 streamlit run app.py
 ```
 Access the application locally at `http://localhost:8501`.
@@ -523,15 +571,15 @@ aws ecr get-login-password --region ${REGION} | docker login --username AWS --pa
 
 # Build for linux/amd64 and push
 docker build --platform linux/amd64 -t query-agent:latest .
-docker tag query-agent:latest ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/query-agent:latest
-docker push ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/query-agent:latest
+docker tag query-agent:latest ${ACCOUNT_ID}.dkr.ecr.${REGION}[.amazonaws.com/query-agent:latest](https://.amazonaws.com/query-agent:latest)
+docker push ${ACCOUNT_ID}.dkr.ecr.${REGION}[.amazonaws.com/query-agent:latest](https://.amazonaws.com/query-agent:latest)
 
 # Trigger zero-downtime rolling deployment
 aws ecs update-service --cluster default --service query-agent --force-new-deployment --region ${REGION}
 ```
 
 ### On-Demand Service Control (Cost Optimization)
-To eliminate 24/7 AWS Fargate compute charges when not actively presenting demos or interviewing, scale the container task count to zero. All S3 data lake files, Glue table catalogs, and Docker container images remain intact.
+To eliminate 24/7 AWS Fargate compute charges when not actively presenting demos or interviewing, scale the container task count to zero. All S3 data lake files, Glue table catalogs, DynamoDB lock tables, and Docker container images remain intact.
 
 - **Stop Service (Scale to 0 tasks — halts compute billing):**
   ```bash
