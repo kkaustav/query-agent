@@ -140,7 +140,6 @@ class AthenaManager:
     _REGISTRY_LOCK = threading.Lock()
     _TABLE_LOCKS: Dict[str, threading.Lock] = {}
     _INGESTION_STATES: Dict[str, Dict[str, Any]] = {}
-    _LOCAL_FENCING_COUNTER: int = 0
 
     def __init__(
         self,
@@ -150,13 +149,13 @@ class AthenaManager:
         work_group: Optional[str] = None,
         max_scan_mb: int = 100,
         query_timeout_sec: int = 30,
-        strict_workgroup_check: bool = False,
+        strict_workgroup_check: bool = True,
         lock_table_name: Optional[str] = None,
         lock_lease_seconds: int = 300,
         lease_heartbeat_interval_sec: Optional[float] = None,
         state_retention_seconds: int = 7 * 86400,
         task_owner_id: Optional[str] = None,
-        use_atomic_glue_cutover: bool = False,
+        use_atomic_glue_cutover: bool = True,
         validate_full_dataset: bool = True,
     ):
         if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", database):
@@ -232,11 +231,11 @@ class AthenaManager:
                 ReturnValues="UPDATED_NEW",
             )
             attrs = resp.get("Attributes", {}) if isinstance(resp, dict) else {}
-            if "counter_value" in attrs and "N" in attrs["counter_value"]:
-                return int(attrs["counter_value"]["N"])
-            with self._REGISTRY_LOCK:
-                AthenaManager._LOCAL_FENCING_COUNTER += 1
-                return AthenaManager._LOCAL_FENCING_COUNTER
+            if "counter_value" not in attrs or "N" not in attrs["counter_value"]:
+                raise AthenaExecutionError(
+                    "Fail-Closed Error: DynamoDB atomic counter response missing 'counter_value'."
+                )
+            return int(attrs["counter_value"]["N"])
         except ClientError as e:
             raise AthenaExecutionError(f"Fail-Closed Error: Could not generate atomic fencing token: {e}") from e
 
@@ -601,7 +600,7 @@ class AthenaManager:
 
         return pruned_prefixes
 
-    def _verify_workgroup_guardrails(self, strict: bool = False) -> bool:
+    def _verify_workgroup_guardrails(self, strict: bool = True) -> bool:
         try:
             wg_resp = self.athena.get_work_group(WorkGroup=self.work_group)
             wg_config = wg_resp.get("WorkGroup", {}).get("Configuration", {})
@@ -948,8 +947,15 @@ class AthenaManager:
                 response = self.glue.get_table(DatabaseName=self.database, Name=table_name)
                 current = copy.deepcopy(response.get("Table", {}))
 
+            allowed_table_input_fields = {
+                "Name", "Description", "Owner", "LastAccessTime", "LastAnalyzedTime",
+                "Retention", "StorageDescriptor", "PartitionKeys", "ViewOriginalText",
+                "ViewExpandedText", "TableType", "Parameters", "TargetTable", "ViewDefinition",
+            }
             table_input = {
-                k: v for k, v in current.items() if k not in GLUE_READ_ONLY_TABLE_FIELDS
+                k: v
+                for k, v in current.items()
+                if k in allowed_table_input_fields and k not in GLUE_READ_ONLY_TABLE_FIELDS
             }
             table_input["Name"] = table_name
             table_input.setdefault("TableType", "EXTERNAL_TABLE")
@@ -1160,7 +1166,7 @@ class AthenaManager:
             version_id = tbl.get("VersionId")
             expected_root = f"s3://{self.bucket_name}/data/{table_name}/"
             s3_prefix = (
-                location.replace(f"s3://{self.bucket_name}/", "", 1)
+                location.replace(f"s3://{self.bucket_name}/", "", 1).rstrip("/") + "/"
                 if isinstance(location, str) and location.startswith(expected_root)
                 else None
             )
@@ -1219,7 +1225,7 @@ class AthenaManager:
         sd = tbl.get("StorageDescriptor", {}) if isinstance(tbl, dict) else {}
         actual_location = sd.get("Location") if isinstance(sd, dict) else None
 
-        if not isinstance(actual_location, str) or actual_location != expected_s3_location:
+        if not isinstance(actual_location, str) or not actual_location.strip() or actual_location.rstrip("/") != expected_s3_location.rstrip("/"):
             raise AthenaExecutionError(
                 f"Cutover verification failed for '{self.database}.{table_name}': "
                 f"Glue table metadata was not replaced (expected {expected_s3_location!r}, "
